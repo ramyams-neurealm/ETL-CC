@@ -1,0 +1,14 @@
+{
+  "source_id": "cfb1a5fb-2ce3-4a9f-9b6e-3ef516eb0865",
+  "fingerprint": "cdcaccc486dc8b62cf2bdce9358baa4fef293c68d5abfe5a180cf687ca6ee2e2",
+  "connection_type": "XML_UPLOAD",
+  "connection_name": "XML_MULTI_MAPPING_TEST_06",
+  "environment": "DEV",
+  "config": {
+    "original_file_name": "sample_informatica_multi_mapping.xml",
+    "stored_file_path": "D:\\ramya.ms\\Documents\\ETL\\etl-cc\\runtime_sources\\xml_upload\\cfb1a5fb-2ce3-4a9f-9b6e-3ef516eb0865\\sample_informatica_multi_mapping.xml",
+    "content_hash": "db9e93b307ad99da82a26583f854f4d054bbd2d0ba5b72bcca5bdecfdce170cc",
+    "file_size": 7038
+  },
+  "credential_ciphertext": null
+}
