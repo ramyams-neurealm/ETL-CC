@@ -28,6 +28,18 @@ ConnectionType = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
 EnvironmentType = Literal["DEV", "STAGING", "PROD"]
 
 
+class ValidationDatabaseConnectionETL(Base):
+    __tablename__ = "validation_database_connection_etl"
+    __table_args__ = (UniqueConstraint("connection_name", name="uq_validation_db_connection_name"), {"schema": ETL_SCHEMA})
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    connection_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    database_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    connection_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    credential_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
+    credential_algorithm: Mapped[str] = mapped_column(String(30), nullable=False, default="FERNET")
+    credential_key_version: Mapped[str] = mapped_column(String(30), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
 class RepositoryETL(Base):
     """Store one configured PowerCenter, GitHub, or XML-upload source."""
 
@@ -594,12 +606,66 @@ class ArtifactContentResponse(ArtifactResponse):
 
 
 
+class SimulationOptions(BaseModel):
+    target_row_count: int = Field(default=1000, ge=1, le=10000)
+    include_null_cases: bool = True
+    include_boundary_cases: bool = True
+    include_negative_cases: bool = True
+    include_duplicate_cases: bool = False
+
+class DatasetFileInput(BaseModel):
+    upload_id: str = Field(min_length=40, max_length=40)
+    dataset_name: str = Field(min_length=1, max_length=200)
+
+class DatabaseTableSelection(BaseModel):
+    connection_id: int
+    dataset_name: str = Field(min_length=1, max_length=200)
+    schema_name: str = Field(min_length=1, max_length=128)
+    table_name: str = Field(min_length=1, max_length=128)
+
+class DatabaseTablesInput(BaseModel):
+    validation_type: Literal["EXECUTE_AND_COMPARE", "TABLE_TO_TABLE_COMPARE"] = "EXECUTE_AND_COMPARE"
+    source_tables: list[DatabaseTableSelection] = Field(min_length=1)
+    target_table: DatabaseTableSelection | None = None
+    comparison_keys: list[str] = Field(default_factory=list)
+    row_limit: int = Field(default=10000, ge=1, le=100000)
+
+class ValidationDatasetUploadResponse(BaseModel):
+    upload_id: str
+    file_name: str
+    file_format: str
+    row_count: int
+    detected_columns: list[str]
+
+class DatabaseConnectionCreateRequest(BaseModel):
+    connection_name: str = Field(min_length=1,max_length=200)
+    database_type: Literal["POSTGRESQL"] = "POSTGRESQL"
+    host: str
+    port: int = Field(default=5432,ge=1,le=65535)
+    database_name: str
+    username: str
+    password: SecretStr
+    ssl_mode: str = "prefer"
+
+class DatabaseConnectionResponse(BaseModel):
+    connection_id: int
+    connection_name: str
+    database_type: str
+    host: str
+    port: int
+    database_name: str
+    username: str
+
 class StartValidationRequest(BaseModel):
     repository_id: int
     etl_object_ids: list[int] = Field(min_length=1)
     conversion_workflow_id: str = Field(min_length=1, max_length=100)
     validation_mode: Literal["STATIC_AND_UNIT_TEST"] = "STATIC_AND_UNIT_TEST"
     minimum_functional_parity: float = Field(default=0.95, ge=0.0, le=1.0)
+    input_mode: Literal["SIMULATE", "DATASET_FILE", "DATABASE_TABLES"] = "SIMULATE"
+    simulation_options: SimulationOptions | None = None
+    dataset_files: list[DatasetFileInput] = Field(default_factory=list)
+    database_tables: DatabaseTablesInput | None = None
 
 
 class StartValidationResponse(BaseModel):
@@ -650,3 +716,33 @@ class ValidationTestCaseResponse(BaseModel):
     duration_seconds: float
     created_at: datetime
     updated_at: datetime
+
+
+class StartDeploymentRequest(BaseModel):
+    repository_id: int
+    etl_object_ids: list[int] = Field(min_length=1)
+    validation_workflow_id: str = Field(min_length=1, max_length=100)
+    target_repository_id: int
+    base_branch: str | None = Field(default=None, max_length=255)
+    repository_path: str = Field(default="migrations", min_length=1, max_length=500)
+    branch_prefix: str = Field(default="neuflow", min_length=1, max_length=100)
+    commit_message: str | None = Field(default=None, max_length=500)
+    create_pull_request: bool = False
+    pull_request_title: str | None = Field(default=None, max_length=300)
+    pull_request_body: str | None = Field(default=None, max_length=4000)
+
+class StartDeploymentResponse(BaseModel):
+    workflow_id: str
+    repository_id: int
+    status: Literal["QUEUED"]
+    mapping_count: int
+    message: str
+
+class DeploymentMappingResponse(BaseModel):
+    etl_object_id: int
+    mapping_name: str
+    migration_status: str
+    branch_name: str | None = None
+    commit_sha: str | None = None
+    pull_request_url: str | None = None
+    deployment_status: str | None = None

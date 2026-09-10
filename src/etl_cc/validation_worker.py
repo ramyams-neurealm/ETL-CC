@@ -1,4 +1,4 @@
-"""Worker for detailed static, unit-test, and functional-parity validation."""
+"""Queue worker for consolidated NeuFlow Zero-Touch Validation."""
 
 import asyncio
 from datetime import datetime, timezone
@@ -8,11 +8,17 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from etl_cc.agents.functional_parity_agent import FunctionalParityAgent
-from etl_cc.agents.static_validation_agent import StaticValidationAgent
-from etl_cc.agents.test_plan_agent import TestPlanAgent
-from etl_cc.agents.unit_test_execution_agent import UnitTestExecutionAgent
+from etl_cc.agents.validation_agent import (
+    ValidationAgent,
+    ValidationContext,
+    ValidationResult,
+    ValidationStageResult,
+)
 from etl_cc.config import settings
+from etl_cc.validation_store import validation_store
+from etl_cc.connectors import load_postgresql_table
+from etl_cc.security import validation_credential_cipher
+from etl_cc.models import ValidationDatabaseConnectionETL
 from etl_cc.database import SessionFactory
 from etl_cc.models import (
     AgentResponseETL,
@@ -26,17 +32,6 @@ from etl_cc.validation_test_case_service import (
     replace_planned_test_cases,
     upsert_test_case,
 )
-
-
-STATIC_TEST_IDS = {
-    "REQUIRED_ARTIFACTS": "STATIC-001",
-    "PYSPARK_CODE_SYNTAX": "STATIC-002",
-    "UNIT_TEST_SYNTAX": "STATIC-003",
-    "CONFIGURATION_JSON": "STATIC-004",
-    "DATABRICKS_RUNTIME_SAFETY": "STATIC-005",
-    "NO_EMBEDDED_SECRETS": "STATIC-006",
-    "SAFE_TEST_IMPORTS": "STATIC-007",
-}
 
 
 async def _claim() -> int | None:
@@ -56,63 +51,17 @@ async def _claim() -> int | None:
                 .with_for_update(skip_locked=True)
                 .limit(1)
             )
-
             if workflow is None:
                 return None
 
             workflow.job_status = "RUNNING"
             workflow.overall_status = "RUNNING"
             workflow.current_stage = "VALIDATION"
+            workflow.failure_stage = None
+            workflow.failure_reason = None
             workflow.started_at = datetime.now(timezone.utc)
             workflow.attempt_count += 1
-
             return workflow.id
-
-
-async def _audit(
-    session: AsyncSession,
-    workflow: WorkflowRunETL,
-    mapping: ETLObjectETL,
-    agent: Any,
-    result: Any,
-) -> AgentResponseETL:
-    """Persist one deterministic agent execution result."""
-    attempt = int(
-        await session.scalar(
-            select(
-                func.coalesce(
-                    func.max(AgentResponseETL.attempt_number),
-                    0,
-                )
-            ).where(
-                AgentResponseETL.workflow_run_id == workflow.id,
-                AgentResponseETL.etl_object_id == mapping.id,
-                AgentResponseETL.agent_name == agent.AGENT_NAME,
-            )
-        )
-        or 0
-    ) + 1
-
-    now = datetime.now(timezone.utc)
-    row = AgentResponseETL(
-        workflow_run_id=workflow.id,
-        etl_object_id=mapping.id,
-        agent_name=agent.AGENT_NAME,
-        agent_version=agent.AGENT_VERSION,
-        stage_name=agent.STAGE_NAME,
-        attempt_number=attempt,
-        status="COMPLETED",
-        request_payload={"etl_object_id": mapping.id},
-        response_payload=result.model_dump(mode="json"),
-        model_name=agent.MODEL_NAME,
-        input_tokens=0,
-        output_tokens=0,
-        started_at=now,
-        completed_at=now,
-    )
-    session.add(row)
-    await session.flush()
-    return row
 
 
 async def _event(
@@ -123,10 +72,12 @@ async def _event(
     message: str,
     progress: int,
     payload: dict[str, Any] | None = None,
+    agent_response_id: int | None = None,
 ) -> None:
     session.add(
         WorkflowEventETL(
             workflow_run_id=workflow.id,
+            agent_response_id=agent_response_id,
             event_type=event_type,
             stage_name="VALIDATION",
             status=event_status,
@@ -136,6 +87,72 @@ async def _event(
             actor_type="SYSTEM",
         )
     )
+    await session.flush()
+
+
+async def _next_attempt(
+    session: AsyncSession,
+    workflow_run_id: int,
+    etl_object_id: int,
+    agent_name: str,
+    stage_name: str,
+) -> int:
+    value = await session.scalar(
+        select(
+            func.coalesce(
+                func.max(AgentResponseETL.attempt_number),
+                0,
+            )
+        ).where(
+            AgentResponseETL.workflow_run_id == workflow_run_id,
+            AgentResponseETL.etl_object_id == etl_object_id,
+            AgentResponseETL.agent_name == agent_name,
+            AgentResponseETL.stage_name == stage_name,
+        )
+    )
+    return int(value or 0) + 1
+
+
+async def _audit_stage(
+    session: AsyncSession,
+    workflow: WorkflowRunETL,
+    mapping: ETLObjectETL,
+    stage: ValidationStageResult,
+) -> AgentResponseETL:
+    """Persist one internal ValidationAgent stage."""
+    attempt = await _next_attempt(
+        session,
+        workflow.id,
+        mapping.id,
+        stage.agent_name,
+        stage.stage_name,
+    )
+    now = datetime.now(timezone.utc)
+    audit = AgentResponseETL(
+        workflow_run_id=workflow.id,
+        etl_object_id=mapping.id,
+        agent_name=stage.agent_name,
+        agent_version=stage.agent_version,
+        stage_name=stage.stage_name,
+        attempt_number=attempt,
+        status=stage.status,
+        request_payload={
+            "etl_object_id": mapping.id,
+            "mapping_name": mapping.object_name,
+        },
+        response_payload=stage.response_payload,
+        model_name=stage.model_name,
+        prompt_name=stage.prompt_name,
+        prompt_version=stage.prompt_version,
+        input_tokens=stage.input_tokens,
+        output_tokens=stage.output_tokens,
+        error_message=stage.error_message,
+        started_at=now,
+        completed_at=now,
+    )
+    session.add(audit)
+    await session.flush()
+    return audit
 
 
 async def _latest_discovery(
@@ -155,171 +172,165 @@ async def _latest_discovery(
     return row.response_payload if row else {}
 
 
-async def _artifacts(
+async def _conversion_artifacts(
     session: AsyncSession,
     conversion_workflow_id: str,
+    repository_id: int,
     mapping_id: int,
 ) -> dict[str, GeneratedArtifactETL]:
-    conversion_workflow = await session.scalar(
+    """Load artifacts from the successful requested Conversion workflow.
+
+    GeneratedArtifactETL.validation_status is mutable after Validation. It must
+    not be used to find the immutable output of a successful Conversion.
+    """
+    conversion = await session.scalar(
         select(WorkflowRunETL).where(
             WorkflowRunETL.workflow_id == conversion_workflow_id,
+            WorkflowRunETL.repository_id == repository_id,
             WorkflowRunETL.job_type == "CONVERSION",
+            WorkflowRunETL.job_status == "COMPLETED",
+            WorkflowRunETL.overall_status == "COMPLETED",
         )
     )
-    if conversion_workflow is None:
-        raise RuntimeError("Conversion workflow was not found.")
+    if conversion is None:
+        raise RuntimeError(
+            "A completed Conversion workflow for this repository was not found."
+        )
 
     rows = list(
         (
             await session.scalars(
                 select(GeneratedArtifactETL)
                 .where(
-                    GeneratedArtifactETL.workflow_run_id
-                    == conversion_workflow.id,
+                    GeneratedArtifactETL.workflow_run_id == conversion.id,
                     GeneratedArtifactETL.etl_object_id == mapping_id,
                 )
                 .order_by(GeneratedArtifactETL.id.desc())
             )
         ).all()
     )
-
     selected: dict[str, GeneratedArtifactETL] = {}
     for row in rows:
         selected.setdefault(row.artifact_type, row)
+
+    required = {"PYSPARK_CODE", "UNIT_TEST", "CONFIGURATION"}
+    missing = required - set(selected)
+    if missing:
+        raise RuntimeError(
+            "Required Conversion artifacts are missing: "
+            + ", ".join(sorted(missing))
+        )
     return selected
 
 
-async def _persist_static_results(
+async def _persist_planned_cases(
     session: AsyncSession,
     workflow: WorkflowRunETL,
     mapping: ETLObjectETL,
-    agent_response: AgentResponseETL,
-    static_result: Any,
+    result: ValidationResult,
 ) -> None:
-    for check in static_result.checks:
-        test_id = STATIC_TEST_IDS.get(check.check_name)
-        if test_id is None:
-            continue
+    plan_stage = next(
+        (
+            stage
+            for stage in result.stages
+            if stage.agent_name == "TEST_PLAN_AGENT"
+        ),
+        None,
+    )
+    if plan_stage is None:
+        return
 
-        await upsert_test_case(
+    raw_cases = plan_stage.response_payload.get("test_cases", [])
+    if not raw_cases:
+        return
+
+    class PlannedCase:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self.test_id = payload["test_id"]
+            self.test_name = (
+                payload.get("test_name")
+                or payload.get("title")
+                or payload["test_id"]
+            )
+            self.category = payload.get("category", "GENERAL")
+            self.severity = payload.get("severity", "HIGH")
+            self.expected_result = payload.get("expected_result", "")
+            self.evidence_payload = payload.get("evidence_payload", {})
+
+    await replace_planned_test_cases(
+        session,
+        workflow.id,
+        mapping.id,
+        [PlannedCase(item) for item in raw_cases],
+    )
+
+
+async def _persist_result(
+    session: AsyncSession,
+    workflow: WorkflowRunETL,
+    mapping: ETLObjectETL,
+    result: ValidationResult,
+) -> None:
+    """Persist stage audits and all detailed tests returned by ValidationAgent."""
+    await _persist_planned_cases(session, workflow, mapping, result)
+
+    audit_by_agent: dict[str, AgentResponseETL] = {}
+    for stage in result.stages:
+        audit_by_agent[stage.agent_name] = await _audit_stage(
             session,
-            workflow_run_id=workflow.id,
-            etl_object_id=mapping.id,
-            agent_response_id=agent_response.id,
-            test_id=test_id,
-            test_name=check.check_name.replace("_", " ").title(),
-            category="STATIC_VALIDATION",
-            status="PASSED" if check.passed else "FAILED",
-            severity=check.severity,
-            expected_result="The static validation check passes.",
-            actual_result="PASSED" if check.passed else "FAILED",
-            details=check.details,
-            evidence_payload={"check_name": check.check_name},
+            workflow,
+            mapping,
+            stage,
         )
 
+    category_agent = {
+        "STATIC_VALIDATION": "STATIC_VALIDATION_AGENT",
+        "UNIT_TEST": "UNIT_TEST_EXECUTION_AGENT",
+        "SYNTHETIC_DATA": "SYNTHETIC_TEST_DATA_AGENT",
+        "FUNCTIONAL_PARITY": "FUNCTIONAL_PARITY_AGENT",
+        "DATA_PARITY": "MATCHFLOW_COMPARATOR",
+    }
 
-async def _persist_unit_results(
-    session: AsyncSession,
-    workflow: WorkflowRunETL,
-    mapping: ETLObjectETL,
-    agent_response: AgentResponseETL,
-    unit_result: Any,
-) -> None:
-    for test_case in unit_result.test_cases:
+    for test in result.test_cases:
+        audit = audit_by_agent.get(category_agent.get(test.category, ""))
         await upsert_test_case(
             session,
             workflow_run_id=workflow.id,
             etl_object_id=mapping.id,
-            agent_response_id=agent_response.id,
-            test_id=test_case.test_id,
-            test_name=test_case.title,
-            category=test_case.category,
-            status=test_case.status,
-            severity="HIGH",
-            expected_result="The generated pytest test passes.",
-            actual_result=test_case.status,
-            details=test_case.details,
-            evidence_payload=test_case.evidence,
-            duration_seconds=test_case.duration_seconds,
-        )
-
-
-async def _persist_parity_results(
-    session: AsyncSession,
-    workflow: WorkflowRunETL,
-    mapping: ETLObjectETL,
-    agent_response: AgentResponseETL,
-    parity_result: Any,
-    minimum: float,
-) -> None:
-    parity_values = [
-        ("PARITY-001", "Source coverage", parity_result.source_coverage),
-        ("PARITY-002", "Target coverage", parity_result.target_coverage),
-        (
-            "PARITY-003",
-            "Target-field coverage",
-            parity_result.target_field_coverage,
-        ),
-        (
-            "PARITY-004",
-            "Business-rule coverage",
-            parity_result.business_rule_coverage,
-        ),
-        ("PARITY-005", "Lineage coverage", parity_result.lineage_coverage),
-        (
-            "PARITY-006",
-            "Precision and scale coverage",
-            parity_result.precision_scale_coverage,
-        ),
-        (
-            "PARITY-007",
-            "Overall functional parity",
-            parity_result.overall_functional_parity,
-        ),
-    ]
-
-    for test_id, test_name, value in parity_values:
-        threshold = minimum if test_id == "PARITY-007" else 1.0
-        passed = value >= threshold
-
-        await upsert_test_case(
-            session,
-            workflow_run_id=workflow.id,
-            etl_object_id=mapping.id,
-            agent_response_id=agent_response.id,
-            test_id=test_id,
-            test_name=test_name,
-            category="FUNCTIONAL_PARITY",
-            status="PASSED" if passed else "FAILED",
-            severity="CRITICAL" if test_id == "PARITY-007" else "HIGH",
-            expected_result=f"Coverage is at least {threshold:.2f}.",
-            actual_result=f"{value:.4f}",
-            details=f"Measured coverage: {value:.4f}.",
-            evidence_payload={
-                "coverage": value,
-                "threshold": threshold,
-            },
+            agent_response_id=audit.id if audit else None,
+            test_id=test.test_id,
+            test_name=test.test_name,
+            category=test.category,
+            status=test.status,
+            severity=test.severity,
+            expected_result=test.expected_result or "",
+            actual_result=test.actual_result or "",
+            details=test.details or "",
+            evidence_payload=test.evidence_payload,
+            duration_seconds=test.duration_seconds,
         )
 
 
 async def _process(workflow_id: int) -> None:
-    """Execute the detailed Validation flow for one workflow."""
+    """Run consolidated ValidationAgent for each selected mapping."""
     async with SessionFactory() as session:
         workflow = await session.get(WorkflowRunETL, workflow_id)
         if workflow is None:
             raise RuntimeError("Validation workflow was not found.")
 
         mapping_ids = workflow.scope_payload.get("etl_object_ids", [])
-        conversion_workflow_id = workflow.scope_payload[
+        conversion_workflow_id = workflow.scope_payload.get(
             "conversion_workflow_id"
-        ]
+        )
+        if not conversion_workflow_id:
+            raise RuntimeError("conversion_workflow_id is required.")
+
         minimum = float(
             workflow.scope_payload.get(
                 "minimum_functional_parity",
                 settings.minimum_functional_parity,
             )
         )
-
         mappings = list(
             (
                 await session.scalars(
@@ -335,135 +346,108 @@ async def _process(workflow_id: int) -> None:
                 )
             ).all()
         )
-
         if not mappings:
-            raise RuntimeError("No mappings were found for validation.")
+            raise RuntimeError("No mappings were selected for Validation.")
+        if len(mappings) != len(set(mapping_ids)):
+            raise RuntimeError(
+                "One or more selected mappings were not found in the repository."
+            )
 
         all_passed = True
+        failure_reasons: list[str] = []
 
         for index, mapping in enumerate(mappings, start=1):
-            generated = await _artifacts(
+            mapping.migration_status = "VALIDATING"
+            await _event(
+                session,
+                workflow,
+                "MAPPING_VALIDATION_STARTED",
+                "RUNNING",
+                f"Validation started for {mapping.object_name}.",
+                int((index - 1) / len(mappings) * 90),
+                {
+                    "etl_object_id": mapping.id,
+                    "migration_wave": mapping.migration_wave,
+                },
+            )
+            await session.commit()
+
+            artifact_rows = await _conversion_artifacts(
                 session,
                 conversion_workflow_id,
+                workflow.repository_id,
                 mapping.id,
             )
-            paths = {
+            artifact_paths = {
                 artifact_type: Path(row.storage_path)
-                for artifact_type, row in generated.items()
+                for artifact_type, row in artifact_rows.items()
             }
-
-            mapping_model = CanonicalMapping.model_validate(
+            canonical = CanonicalMapping.model_validate(
                 mapping.source_definition
             )
             discovery = await _latest_discovery(session, mapping.id)
 
-            plan_agent = TestPlanAgent()
-            plan_result = plan_agent.run(mapping_model, discovery)
-            await _audit(
-                session,
-                workflow,
-                mapping,
-                plan_agent,
-                plan_result,
-            )
-            await replace_planned_test_cases(
-                session,
-                workflow.id,
-                mapping.id,
-                plan_result.test_cases,
-            )
+            input_mode = workflow.scope_payload.get("input_mode", "SIMULATE")
+            input_datasets = {}
+            expected_output_rows = None
+            requested_row_count = int((workflow.scope_payload.get("simulation_options") or {}).get("target_row_count", settings.validation_simulation_default_rows))
+            if input_mode == "DATASET_FILE":
+                for item in workflow.scope_payload.get("dataset_files", []):
+                    input_datasets[item["dataset_name"]] = validation_store.load_upload(item["upload_id"])
+            elif input_mode == "DATABASE_TABLES":
+                specification = workflow.scope_payload.get("database_tables") or {}
+                for item in specification.get("source_tables", []):
+                    connection_row = await session.get(ValidationDatabaseConnectionETL, item["connection_id"])
+                    if connection_row is None: raise RuntimeError("Validation database connection was not found.")
+                    if connection_row.database_type != "POSTGRESQL": raise RuntimeError("UNSUPPORTED_DATABASE_TYPE")
+                    password = validation_credential_cipher().decrypt(connection_row.credential_ciphertext)
+                    input_datasets[item["dataset_name"]] = await load_postgresql_table(connection_row.connection_config, password, item["schema_name"], item["table_name"], int(specification.get("row_limit", settings.validation_database_row_limit)))
+                target_spec = specification.get("target_table")
+                if specification.get("validation_type") == "TABLE_TO_TABLE_COMPARE" and target_spec:
+                    connection_row = await session.get(ValidationDatabaseConnectionETL, target_spec["connection_id"])
+                    password = validation_credential_cipher().decrypt(connection_row.credential_ciphertext)
+                    expected_output_rows = await load_postgresql_table(connection_row.connection_config,password,target_spec["schema_name"],target_spec["table_name"],int(specification.get("row_limit",settings.validation_database_row_limit)))
 
-            static_agent = StaticValidationAgent()
-            static_result = static_agent.run(paths)
-            static_audit = await _audit(
-                session,
-                workflow,
-                mapping,
-                static_agent,
-                static_result,
-            )
-            await _persist_static_results(
-                session,
-                workflow,
-                mapping,
-                static_audit,
-                static_result,
-            )
-
-            unit_agent = UnitTestExecutionAgent()
-            if static_result.safe_to_execute_tests:
-                unit_result = unit_agent.run(
-                    paths["UNIT_TEST"],
-                    settings.validation_test_timeout_seconds,
+            result = await ValidationAgent().run(
+                ValidationContext(
+                    workflow_id=workflow.workflow_id,
+                    mapping=canonical,
+                    discovery=discovery,
+                    lineage=mapping.lineage or {},
+                    artifact_paths=artifact_paths,
+                    minimum_functional_parity=minimum,
+                    input_mode=input_mode,
+                    input_datasets=input_datasets,
+                    expected_output_rows=expected_output_rows,
+                    requested_row_count=requested_row_count,
                 )
-            else:
-                unit_result = unit_agent.skipped(
-                    "Static validation failed; execution was blocked safely."
-                )
-
-            unit_audit = await _audit(
+            )
+            await _persist_result(
                 session,
                 workflow,
                 mapping,
-                unit_agent,
-                unit_result,
-            )
-            await _persist_unit_results(
-                session,
-                workflow,
-                mapping,
-                unit_audit,
-                unit_result,
+                result,
             )
 
-            code_path = paths.get("PYSPARK_CODE")
-            code = (
-                code_path.read_text(encoding="utf-8")
-                if code_path and code_path.is_file()
-                else ""
-            )
-
-            parity_agent = FunctionalParityAgent()
-            parity_result = parity_agent.run(
-                mapping_model,
-                discovery,
-                mapping.lineage or {},
-                code,
-                minimum,
-            )
-            parity_audit = await _audit(
-                session,
-                workflow,
-                mapping,
-                parity_agent,
-                parity_result,
-            )
-            await _persist_parity_results(
-                session,
-                workflow,
-                mapping,
-                parity_audit,
-                parity_result,
-                minimum,
-            )
-
-            passed = (
-                static_result.status == "PASSED"
-                and unit_result.status == "PASSED"
-                and parity_result.status == "PASSED"
-            )
+            passed = result.status == "PASSED" and result.deployable
             all_passed = all_passed and passed
             mapping.migration_status = (
                 "VALIDATED" if passed else "VALIDATION_FAILED"
             )
 
-            for artifact in generated.values():
-                artifact.validation_status = (
-                    "VALIDATED" if passed else "FAILED"
-                )
+            for artifact in artifact_rows.values():
+                # Keep CRITIQUE_APPROVED after failure so approved Conversion
+                # artifacts can be validated again. Promote only on success.
+                if passed:
+                    artifact.validation_status = "VALIDATED"
                 artifact.is_deployable = passed
 
-            progress = int(index / len(mappings) * 90)
+            if not passed:
+                failure_reasons.append(
+                    f"{mapping.object_name}: "
+                    f"{result.failure_reason or 'Validation failed.'}"
+                )
+
             await _event(
                 session,
                 workflow,
@@ -473,11 +457,17 @@ async def _process(workflow_id: int) -> None:
                     f"Validation {'passed' if passed else 'failed'} "
                     f"for {mapping.object_name}."
                 ),
-                progress,
+                int(index / len(mappings) * 90),
                 {
                     "etl_object_id": mapping.id,
                     "passed": passed,
-                    "planned_test_count": plan_result.test_count,
+                    "deployable": result.deployable,
+                    "match_percentage": result.match_percentage,
+                    "rows_compared": result.rows_compared,
+                    "confidence_index": result.confidence_index,
+                    "failure_reason": result.failure_reason,
+                    "recommendation": result.recommendation,
+                    "data_files": result.data_files,
                 },
             )
             await session.commit()
@@ -487,12 +477,9 @@ async def _process(workflow_id: int) -> None:
         workflow.overall_status = "COMPLETED" if all_passed else "FAILED"
         workflow.failure_stage = None if all_passed else "VALIDATION"
         workflow.failure_reason = (
-            None
-            if all_passed
-            else "One or more mappings failed validation."
+            None if all_passed else " | ".join(failure_reasons)[:4000]
         )
         workflow.completed_at = datetime.now(timezone.utc)
-
         await _event(
             session,
             workflow,
@@ -500,31 +487,32 @@ async def _process(workflow_id: int) -> None:
             workflow.overall_status,
             "Validation workflow completed.",
             100,
-            {"all_passed": all_passed},
+            {
+                "all_passed": all_passed,
+                "mapping_count": len(mappings),
+            },
         )
         await session.commit()
 
 
 async def _fail(workflow_id: int, exc: Exception) -> None:
-    """Mark an unexpected Validation processing error."""
+    """Mark an unexpected worker or ValidationAgent failure."""
     async with SessionFactory() as session:
         workflow = await session.get(WorkflowRunETL, workflow_id)
         if workflow is None:
             return
-
         workflow.current_stage = "VALIDATION"
         workflow.job_status = "FAILED"
         workflow.overall_status = "FAILED"
         workflow.failure_stage = "VALIDATION"
         workflow.failure_reason = str(exc)[:4000]
         workflow.completed_at = datetime.now(timezone.utc)
-
         await _event(
             session,
             workflow,
             "VALIDATION_FAILED",
             "FAILED",
-            "Validation workflow failed.",
+            "Validation workflow failed unexpectedly.",
             100,
             {
                 "error_type": type(exc).__name__,
@@ -541,7 +529,6 @@ async def run_validation_worker() -> None:
         if workflow_id is None:
             await asyncio.sleep(settings.worker_poll_seconds)
             continue
-
         try:
             await _process(workflow_id)
         except Exception as exc:

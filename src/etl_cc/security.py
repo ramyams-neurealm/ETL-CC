@@ -282,3 +282,6 @@ def verify_connection_test_token(
         )
 
     return payload
+
+def validation_credential_cipher() -> CredentialCipher:
+    return CredentialCipher(settings.etl_credential_encryption_key)

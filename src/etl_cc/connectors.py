@@ -224,3 +224,19 @@ class GitHubSource(MappingSource):
                 )
             )
         return result
+
+
+_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+def _identifier(value: str) -> str:
+    if not _IDENTIFIER.fullmatch(value): raise ETLConnectionError(f"Invalid database identifier: {value}")
+    return value
+
+async def load_postgresql_table(config: dict, password: str, schema_name: str, table_name: str, row_limit: int) -> list[dict]:
+    import asyncpg
+    schema=_identifier(schema_name); table=_identifier(table_name)
+    connection=await asyncpg.connect(host=config["host"],port=int(config.get("port",5432)),database=config["database_name"],user=config["username"],password=password,ssl=config.get("ssl_mode","prefer"),timeout=settings.validation_database_timeout_seconds)
+    try:
+        rows=await connection.fetch(f'SELECT * FROM "{schema}"."{table}" LIMIT $1', int(row_limit))
+        return [dict(row) for row in rows]
+    finally:
+        await connection.close()

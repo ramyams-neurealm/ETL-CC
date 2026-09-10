@@ -1,0 +1,32 @@
+[
+  {
+    "ACCOUNT_ID": 1,
+    "ACCOUNT_STATUS": "active",
+    "ACCOUNT_BALANCE": 1000.0
+  },
+  {
+    "ACCOUNT_ID": 2,
+    "ACCOUNT_STATUS": null,
+    "ACCOUNT_BALANCE": 2000.0
+  },
+  {
+    "ACCOUNT_ID": 3,
+    "ACCOUNT_STATUS": "inactive",
+    "ACCOUNT_BALANCE": 9999999999999.99
+  },
+  {
+    "ACCOUNT_ID": 4,
+    "ACCOUNT_STATUS": "Pending",
+    "ACCOUNT_BALANCE": 500.5
+  },
+  {
+    "ACCOUNT_ID": 5,
+    "ACCOUNT_STATUS": "closed",
+    "ACCOUNT_BALANCE": 750.75
+  },
+  {
+    "ACCOUNT_ID": 5,
+    "ACCOUNT_STATUS": "open",
+    "ACCOUNT_BALANCE": 750.75
+  }
+]

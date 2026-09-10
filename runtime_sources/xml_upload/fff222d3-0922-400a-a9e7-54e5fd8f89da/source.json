@@ -1,0 +1,14 @@
+{
+  "source_id": "fff222d3-0922-400a-a9e7-54e5fd8f89da",
+  "fingerprint": "96e547981532f8e42efacc13322904aa2decd6a50973fae0b54297d8a46cc7db",
+  "connection_type": "XML_UPLOAD",
+  "connection_name": "NEUFLOW_E2E_DEMO",
+  "environment": "DEV",
+  "config": {
+    "original_file_name": "sample_informatica_multi_mapping.xml",
+    "stored_file_path": "D:\\ramya.ms\\Documents\\ETL\\etl-cc\\runtime_sources\\xml_upload\\fff222d3-0922-400a-a9e7-54e5fd8f89da\\sample_informatica_multi_mapping.xml",
+    "content_hash": "db9e93b307ad99da82a26583f854f4d054bbd2d0ba5b72bcca5bdecfdce170cc",
+    "file_size": 7038
+  },
+  "credential_ciphertext": null
+}

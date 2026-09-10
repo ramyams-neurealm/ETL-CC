@@ -42,7 +42,19 @@ class Settings(BaseSettings):
     validation_test_timeout_seconds: int = 120
     minimum_functional_parity: float = 0.95
     validation_upload_directory_name: str = "runtime_validation_uploads"
+    validation_upload_max_bytes: int = 104857600
+    validation_upload_max_rows: int = 100000
+    synthetic_validation_max_scenarios: int = 30
+    synthetic_validation_max_rows: int = 10000
+    validation_simulation_default_rows: int = 1000
+    validation_simulation_max_rows: int = 10000
+    validation_database_row_limit: int = 10000
+    validation_database_timeout_seconds: int = 60
 
+    git_deployment_repository_path: str = "migrations"
+    git_deployment_branch_prefix: str = "neuflow"
+    git_command_timeout_seconds: int = 180
+    deployment_max_attempts: int = 1
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",

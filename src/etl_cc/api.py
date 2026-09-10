@@ -40,6 +40,12 @@ from etl_cc.models import (
     ValidationMappingResponse,
     ValidationReportResponse,
     ValidationTestCaseResponse,
+    ValidationDatasetUploadResponse,
+    DatabaseConnectionCreateRequest,
+    DatabaseConnectionResponse,
+    StartDeploymentRequest,
+    StartDeploymentResponse,
+    DeploymentMappingResponse,
 )
 from etl_cc.security import ConnectionTestTokenError
 from etl_cc.services import (
@@ -68,6 +74,10 @@ from etl_cc.services import (
     start_conversion,
     start_discovery,
     start_validation,
+    create_validation_database_connection,
+    start_deployment,
+    get_deployment_workflow,
+    list_deployment_mappings,
 )
 from etl_cc.validation_store import validation_store
 
@@ -463,6 +473,24 @@ async def artifact_content(
     return result
 
 
+
+
+@router.post("/validations/datasets", response_model=ValidationDatasetUploadResponse, tags=["Zero-Touch Validation"])
+async def upload_validation_dataset(file: UploadFile = File(...)):
+    from etl_cc.validation_store import validation_store
+    try:
+        return validation_store.stage(file.filename or "dataset", await file.read())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@router.post("/validation-database-connections", response_model=DatabaseConnectionResponse, tags=["Zero-Touch Validation"])
+async def create_validation_connection(request: DatabaseConnectionCreateRequest, session: AsyncSession = Depends(get_session)):
+    try:
+        return await create_validation_database_connection(session, request)
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 @router.post(
     "/validations",
     response_model=StartValidationResponse,
@@ -619,3 +647,22 @@ async def data_comparison(
         )
     except (ValueError, InvalidOperation) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/deployments", response_model=StartDeploymentResponse, status_code=status.HTTP_202_ACCEPTED, tags=["Git Deployment"])
+async def create_deployment(request: StartDeploymentRequest, session: AsyncSession = Depends(get_session)):
+    try: return await start_deployment(session, request)
+    except ValueError as exc:
+        await session.rollback(); raise HTTPException(status_code=400, detail={"status":"FAILED","stage":"DEPLOYMENT_START","reason":str(exc)}) from exc
+
+@router.get("/deployments/{workflow_id}", tags=["Git Deployment"])
+async def deployment_status(workflow_id: str, session: AsyncSession = Depends(get_session)):
+    row=await get_deployment_workflow(session, workflow_id)
+    if row is None: raise HTTPException(status_code=404, detail="Deployment workflow not found.")
+    return _workflow_payload(row)
+
+@router.get("/deployments/{workflow_id}/mappings", response_model=list[DeploymentMappingResponse], tags=["Git Deployment"])
+async def deployment_mappings(workflow_id: str, session: AsyncSession = Depends(get_session)):
+    result=await list_deployment_mappings(session, workflow_id)
+    if result is None: raise HTTPException(status_code=404, detail="Deployment workflow not found.")
+    return result

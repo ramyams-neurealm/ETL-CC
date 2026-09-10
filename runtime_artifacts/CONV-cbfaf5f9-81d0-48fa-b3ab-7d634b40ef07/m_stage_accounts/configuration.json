@@ -1,0 +1,23 @@
+{
+    "mapping_name": "m_stage_accounts",
+    "source": {
+        "name": "RAW_ACCOUNT",
+        "type": "SOURCE",
+        "fields": [
+            {"name": "ACCOUNT_ID", "data_type": "integer", "nullable": false},
+            {"name": "ACCOUNT_STATUS", "data_type": "varchar", "nullable": true},
+            {"name": "ACCOUNT_BALANCE", "data_type": "decimal", "nullable": true}
+        ]
+    },
+    "target": {
+        "name": "STG_ACCOUNT",
+        "type": "TARGET",
+        "fields": [
+            {"name": "ACCOUNT_ID", "data_type": "integer", "nullable": false},
+            {"name": "ACCOUNT_STATUS", "data_type": "varchar", "nullable": true},
+            {"name": "ACCOUNT_BALANCE", "data_type": "decimal", "nullable": true}
+        ]
+    },
+    "runtime": {},
+    "manual_actions": []
+}

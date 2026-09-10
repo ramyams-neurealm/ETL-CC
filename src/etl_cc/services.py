@@ -38,6 +38,9 @@ from etl_cc.models import (
     StartDiscoveryRequest,
     StartValidationRequest,
     StartValidationResponse,
+    StartDeploymentRequest,
+    StartDeploymentResponse,
+    DeploymentMappingResponse,
     ValidationMappingResponse,
     ValidationReportResponse,
     ValidationTestCaseETL,
@@ -772,6 +775,12 @@ async def start_validation(
     session: AsyncSession,
     request: StartValidationRequest,
 ) -> StartValidationResponse:
+    if request.input_mode == "DATASET_FILE" and not request.dataset_files:
+        raise ValueError("dataset_files is required for DATASET_FILE mode.")
+    if request.input_mode == "DATABASE_TABLES" and request.database_tables is None:
+        raise ValueError("database_tables is required for DATABASE_TABLES mode.")
+    if request.input_mode == "SIMULATE" and (request.dataset_files or request.database_tables):
+        raise ValueError("SIMULATE mode cannot include file or database inputs.")
     repository = await session.get(RepositoryETL, request.repository_id)
     if repository is None:
         raise ValueError("Repository not found.")
@@ -843,6 +852,10 @@ async def start_validation(
             "conversion_workflow_id": request.conversion_workflow_id,
             "validation_mode": request.validation_mode,
             "minimum_functional_parity": request.minimum_functional_parity,
+            "input_mode": request.input_mode,
+            "simulation_options": request.simulation_options.model_dump(mode="json") if request.simulation_options else None,
+            "dataset_files": [item.model_dump(mode="json") for item in request.dataset_files],
+            "database_tables": request.database_tables.model_dump(mode="json") if request.database_tables else None,
         },
         max_attempts=1,
     )
@@ -1014,3 +1027,50 @@ async def list_validation_test_cases(
         created_at=row.created_at,
         updated_at=row.updated_at,
     ) for row in rows]
+
+
+async def create_validation_database_connection(session, request):
+    from etl_cc.models import ValidationDatabaseConnectionETL, DatabaseConnectionResponse
+    from etl_cc.security import validation_credential_cipher
+    row=ValidationDatabaseConnectionETL(connection_name=request.connection_name,database_type=request.database_type,connection_config={"host":request.host,"port":request.port,"database_name":request.database_name,"username":request.username,"ssl_mode":request.ssl_mode},credential_ciphertext=validation_credential_cipher().encrypt(request.password.get_secret_value()),credential_key_version=settings.etl_credential_key_version)
+    session.add(row); await session.commit(); await session.refresh(row)
+    return DatabaseConnectionResponse(connection_id=row.id,connection_name=row.connection_name,database_type=row.database_type,**{k:row.connection_config[k] for k in ("host","port","database_name","username")})
+
+
+async def start_deployment(session: AsyncSession, request: StartDeploymentRequest) -> StartDeploymentResponse:
+    repository = await session.get(RepositoryETL, request.repository_id)
+    if repository is None: raise ValueError("Repository not found.")
+    target = await session.get(RepositoryETL, request.target_repository_id)
+    if target is None or target.connection_type != "GITHUB": raise ValueError("A saved GitHub repository is required as the deployment target.")
+    validation = await session.scalar(select(WorkflowRunETL).where(WorkflowRunETL.workflow_id==request.validation_workflow_id,WorkflowRunETL.repository_id==request.repository_id,WorkflowRunETL.job_type=="VALIDATION",WorkflowRunETL.job_status=="COMPLETED"))
+    if validation is None: raise ValueError("A completed Validation workflow was not found.")
+    selected_ids=list(dict.fromkeys(request.etl_object_ids)); validation_ids=set(validation.scope_payload.get("etl_object_ids",[]))
+    if not set(selected_ids).issubset(validation_ids): raise ValueError("One or more mappings are not part of the Validation workflow.")
+    mappings=list((await session.scalars(select(ETLObjectETL).where(ETLObjectETL.repository_id==request.repository_id,ETLObjectETL.id.in_(selected_ids)))).all())
+    if len(mappings)!=len(selected_ids): raise ValueError("One or more mappings do not belong to the repository.")
+    workflows=[]
+    for mapping in mappings:
+        validation_agent=await _latest_agent_response(session,etl_object_id=mapping.id,workflow_run_id=validation.id,agent_name="VALIDATION_AGENT")
+        payload=validation_agent.response_payload if validation_agent else {}
+        if payload.get("status")!="PASSED" or not payload.get("deployable") or payload.get("oracle_strength")!="STRONG" or not payload.get("full_reference_coverage") or payload.get("human_review_required") or payload.get("unsupported_constructs"):
+            raise ValueError(f"Mapping {mapping.object_name} is not eligible for Git deployment.")
+        suffix=validation.workflow_id.split("-")[1][:8] if "-" in validation.workflow_id else validation.workflow_id[:8]
+        clean=re.sub(r"[^A-Za-z0-9_.-]+","-",mapping.object_name).strip("-").lower()
+        branch=f"{request.branch_prefix}/{clean}/{suffix}"
+        workflow=WorkflowRunETL(workflow_id=f"DEP-{uuid4()}",batch_id=None,repository_id=request.repository_id,etl_object_id=mapping.id,current_stage="DEPLOYMENT",overall_status="QUEUED",job_type="DEPLOYMENT",job_status="QUEUED",scope_payload={"validation_workflow_id":validation.workflow_id,"target_repository_id":request.target_repository_id,"base_branch":request.base_branch,"repository_path":request.repository_path,"branch_name":branch,"commit_message":request.commit_message or f"Deploy validated migration for {mapping.object_name}","create_pull_request":request.create_pull_request,"pull_request_title":request.pull_request_title,"pull_request_body":request.pull_request_body},max_attempts=settings.deployment_max_attempts)
+        session.add(workflow); await session.flush(); workflows.append(workflow); mapping.migration_status="DEPLOYMENT_QUEUED"
+        session.add(WorkflowEventETL(workflow_run_id=workflow.id,event_type="DEPLOYMENT_QUEUED",stage_name="DEPLOYMENT",status="QUEUED",progress_percentage=0,message="Git deployment queued.",event_payload={"mapping_id":mapping.id,"branch_name":branch},actor_type="SYSTEM"))
+    await session.commit()
+    return StartDeploymentResponse(workflow_id=workflows[0].workflow_id,repository_id=request.repository_id,status="QUEUED",mapping_count=len(workflows),message="Git deployment workflow queued." if len(workflows)==1 else f"{len(workflows)} Git deployment workflows queued; first workflow ID returned.")
+
+async def get_deployment_workflow(session: AsyncSession, workflow_id: str) -> WorkflowRunETL | None:
+    row=await get_workflow_by_external_id(session,workflow_id)
+    return row if row and row.job_type=="DEPLOYMENT" else None
+
+async def list_deployment_mappings(session: AsyncSession, workflow_id: str) -> list[DeploymentMappingResponse] | None:
+    workflow=await get_deployment_workflow(session,workflow_id)
+    if workflow is None: return None
+    mapping=await session.get(ETLObjectETL,workflow.etl_object_id)
+    response=await _latest_agent_response(session,etl_object_id=workflow.etl_object_id,workflow_run_id=workflow.id,agent_name="GIT_DEPLOYMENT_AGENT")
+    payload=response.response_payload if response else {}
+    return [DeploymentMappingResponse(etl_object_id=mapping.id,mapping_name=mapping.object_name,migration_status=mapping.migration_status,branch_name=payload.get("branch_name") or workflow.scope_payload.get("branch_name"),commit_sha=payload.get("commit_sha"),pull_request_url=payload.get("pull_request_url"),deployment_status=payload.get("status") or workflow.job_status)]
