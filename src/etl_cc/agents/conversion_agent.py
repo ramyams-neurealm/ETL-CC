@@ -41,11 +41,11 @@ class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "2.0.0"
+    AGENT_VERSION = "2.4.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "INFORMATICA_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "2.0.0"
+    PROMPT_VERSION = "2.4.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
@@ -127,9 +127,9 @@ class ConversionAgent:
                 ],
                 "required_transform_function": "transform",
                 "generated_code_contract": {
-                    "input": "One pyspark.sql.DataFrame",
+                    "input": "A dict[str, pyspark.sql.DataFrame] keyed by canonical source dataset name",
                     "output": "One pyspark.sql.DataFrame",
-                    "signature": "def transform(input_df: DataFrame) -> DataFrame",
+                    "signature": "def transform(inputs: dict[str, DataFrame]) -> DataFrame",
                 },
             },
         }
@@ -147,12 +147,25 @@ CONFIGURATION file.
 
 PYSPARK_CODE requirements:
 - Define exactly one public function named transform.
-- Use: def transform(input_df: DataFrame) -> DataFrame.
-- Accept one input DataFrame and return one output DataFrame.
+- Use: def transform(inputs: dict[str, DataFrame]) -> DataFrame.
+- The dictionary keys must be the exact canonical source dataset names supplied in evidence.
+- Resolve each source independently, for example: customers_df = inputs["SRC_CUSTOMERS"].
+- Implement joins and lookups between the named DataFrames. Never assume that multiple sources are pre-flattened.
+- Alias every join input. When two inputs share a field name, qualify each reference and immediately project the joined DataFrame to unique canonical names with explicit aliases.
+- Never carry duplicate unqualified column names beyond a join. Every later filter, expression, aggregation, and final projection must reference an unambiguous column.
+- For connector renames, use the canonical downstream field name. Example: orders.ORDER_ID may be projected as ORDER_KEY only at the grounded rename/projection step.
+- For a single-source mapping, still use the same dictionary contract with one entry.
+- Accept one dictionary of named source DataFrames and return one output DataFrame.
 - Contain transformation logic only.
 - Preserve filters, expressions, target names, decimal precision, scale, and
   documented null behavior.
 - Select target columns explicitly in target-schema order.
+- A nullable field used in a filter follows normal Spark SQL three-valued
+  semantics unless supplied evidence defines different null behavior. Do not
+  invent an additional null rule merely because the field is nullable.
+- Fields used only for FILTER, JOIN, GROUP, SORT, ROUTE, or derivation input
+  must not be projected into the final DataFrame unless present in the
+  canonical target schema.
 - Use pyspark.sql.functions.col for column references.
 - Be importable without executing a Spark job.
 - Do not create or stop a SparkSession.
@@ -163,7 +176,7 @@ PYSPARK_CODE requirements:
 
 UNIT_TEST requirements:
 - Use pytest.
-- Import transform from the generated module and call transform(input_df).
+- Import transform from the generated module and call transform(inputs), where inputs is keyed by exact canonical source dataset names.
 - Create a local SparkSession only inside a pytest fixture and stop it during
   fixture cleanup.
 - Use in-memory DataFrames.
@@ -182,7 +195,23 @@ CONFIGURATION requirements:
 - If a runtime value is unknown, add a manual action rather than a placeholder.
 
 When critique feedback is supplied, correct every issue without changing valid
-mapping behavior. Return only the requested structured output.
+mapping behavior.
+
+Derived-field and lineage requirements:
+- Implement every canonical transformation expression whose output reaches a target.
+- Preserve connector-grounded aggregation, join, lookup/enrichment, filter, and null semantics.
+- The final select must explicitly project every canonical target field in target order.
+- Do not add logging merely to prove lineage. Lineage is demonstrated by executable column expressions and final projection.
+
+UNIT_TEST data requirements:
+- Values supplied to spark.createDataFrame must be native Python values.
+- Use datetime.datetime for timestamp fields, datetime.date for date fields, and Decimal from strings for decimal fields.
+- Never place pyspark.sql.Column expressions such as F.lit, F.to_timestamp, or F.to_date inside Python row tuples or dictionaries.
+- Compute expected rows by applying the complete canonical operation sequence: joins, derivations, filters, routing, aggregation, renames, and final projection.
+- Never include an expected output row that fails a canonical FILTER or ROUTE predicate. Negative and boundary inputs must be asserted as absent from output.
+- Prefer assertions keyed by deterministic target fields rather than full-row equality when runtime-generated timestamps are present.
+- For filtered mappings, include at least one accepted input and one rejected input, then assert the rejected key is absent.
+Return only the requested structured output.
 """.strip()
 
         llm = DynamicChatOpenAI(
@@ -208,9 +237,75 @@ mapping behavior. Return only the requested structured output.
         for generated_file in parsed.generated_files:
             generated_file.content = self._strip_fences(generated_file.content)
 
+        self._normalize_configuration(parsed, mapping)
         self._capture_usage(raw)
         self._validate_result(parsed, mapping)
         return parsed
+
+    def _normalize_configuration(
+        self,
+        result: ConversionResult,
+        mapping: CanonicalMapping,
+    ) -> None:
+        """Complete safe configuration fields from canonical metadata."""
+        files = [
+            item for item in result.generated_files
+            if item.artifact_type == "CONFIGURATION"
+        ]
+        if len(files) != 1:
+            return
+        generated_file = files[0]
+        try:
+            configuration = json.loads(generated_file.content)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(configuration, dict):
+            return
+
+        sources = [
+            {
+                "name": item.name,
+                "dataset_type": item.dataset_type,
+                "connection_name": item.connection_name,
+            }
+            for item in mapping.sources
+        ]
+        targets = [
+            {
+                "name": item.name,
+                "dataset_type": item.dataset_type,
+                "connection_name": item.connection_name,
+            }
+            for item in mapping.targets
+        ]
+
+        source = configuration.get("source")
+        if not isinstance(source, dict):
+            source = {}
+            configuration["source"] = source
+        source.setdefault("name", sources[0]["name"] if sources else None)
+        source.setdefault("datasets", sources)
+
+        target = configuration.get("target")
+        if not isinstance(target, dict):
+            target = {}
+            configuration["target"] = target
+        target.setdefault("name", targets[0]["name"] if targets else None)
+        target.setdefault("datasets", targets)
+
+        configuration["mapping_name"] = mapping.mapping_name
+        runtime = configuration.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            configuration["runtime"] = runtime
+        runtime.setdefault("target_platform", "DATABRICKS")
+        runtime.setdefault("target_framework", "PYSPARK")
+        if not isinstance(configuration.get("manual_actions"), list):
+            configuration["manual_actions"] = list(result.manual_actions)
+
+        generated_file.content = (
+            json.dumps(configuration, indent=2, sort_keys=True) + "\n"
+        )
 
     def _validate_result(
         self,
@@ -323,7 +418,17 @@ mapping behavior. Return only the requested structured output.
         ]
         if len(positional_arguments) != 1:
             errors.append(
-                "transform must accept exactly one positional DataFrame argument."
+                "transform must accept exactly one positional named-input dictionary argument."
+            )
+
+        source_field_owners: dict[str, set[str]] = {}
+        # The generated function must make duplicate source fields unambiguous.
+        # A lightweight AST/text gate checks that join-heavy code uses aliases
+        # and qualified column references rather than bare duplicate names.
+        if ".join(" in content and ".alias(" not in content:
+            errors.append(
+                "Multi-source joins must alias their input DataFrames and use "
+                "qualified column references."
             )
 
         if not any(

@@ -149,7 +149,12 @@ class _Structured:
 
 
 class DynamicChatOpenAI:
-    """Create a fresh ChatOpenAI client after each Key Vault secret retrieval."""
+    """Create a fresh ChatOpenAI client after each Key Vault secret retrieval.
+
+    The application output-token limit is optional. When no value is configured,
+    max_tokens is omitted and the OpenAI provider/model deployment applies its
+    native output limit.
+    """
 
     def __init__(
         self,
@@ -157,28 +162,41 @@ class DynamicChatOpenAI:
         model: str | None = None,
         temperature: float | None = None,
         timeout: float | None = None,
+        max_output_tokens: int | None = None,
         **kwargs: Any,
     ) -> None:
         self.operation_name = operation_name
         self.model = model or settings.openai_model
         self.temperature = (
-            settings.openai_temperature if temperature is None else temperature
+            settings.openai_temperature
+            if temperature is None
+            else temperature
         )
         self.timeout = timeout or settings.openai_timeout_seconds
+        self.max_output_tokens = (
+            max_output_tokens
+            if max_output_tokens is not None
+            else settings.openai_max_output_tokens
+        )
         self.kwargs = kwargs
 
     def _build(self):
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(
-            model=self.model,
-            temperature=self.temperature,
-            api_key=key_vault_service.get_openai_key(self.operation_name),
-            timeout=self.timeout,
-            max_retries=0,
-            max_tokens=settings.openai_max_output_tokens,
+        options: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "api_key": key_vault_service.get_openai_key(
+                self.operation_name
+            ),
+            "timeout": self.timeout,
+            "max_retries": 0,
             **self.kwargs,
-        )
+        }
+        if self.max_output_tokens is not None:
+            options["max_tokens"] = self.max_output_tokens
+
+        return ChatOpenAI(**options)
 
     def _invoke(
         self,
@@ -218,12 +236,31 @@ class DynamicChatOpenAI:
                     ) from None
                 raise
 
-        raise OpenAIServiceUnavailableError(self.operation_name, "retry_exhausted")
+        raise OpenAIServiceUnavailableError(
+            self.operation_name,
+            "retry_exhausted",
+        )
 
-    def invoke(self, input_value: Any, config: Any = None, **kwargs: Any) -> Any:
-        return self._invoke(input_value, None, {}, config, kwargs)
+    def invoke(
+        self,
+        input_value: Any,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        return self._invoke(
+            input_value,
+            None,
+            {},
+            config,
+            kwargs,
+        )
 
-    async def ainvoke(self, input_value: Any, config: Any = None, **kwargs: Any) -> Any:
+    async def ainvoke(
+        self,
+        input_value: Any,
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
         return await asyncio.to_thread(
             self.invoke,
             input_value,
@@ -231,14 +268,32 @@ class DynamicChatOpenAI:
             **kwargs,
         )
 
-    def with_structured_output(self, schema: Any, **kwargs: Any) -> _Structured:
+    def with_structured_output(
+        self,
+        schema: Any,
+        **kwargs: Any,
+    ) -> _Structured:
         return _Structured(self, schema, kwargs)
 
     def with_config(self, **kwargs: Any) -> "DynamicChatOpenAI":
+        merged_kwargs = dict(self.kwargs)
+        model = kwargs.pop("model", self.model)
+        temperature = kwargs.pop(
+            "temperature",
+            self.temperature,
+        )
+        timeout = kwargs.pop("timeout", self.timeout)
+        max_output_tokens = kwargs.pop(
+            "max_output_tokens",
+            self.max_output_tokens,
+        )
+        merged_kwargs.update(kwargs)
+
         return DynamicChatOpenAI(
             operation_name=self.operation_name,
-            model=self.model,
-            temperature=kwargs.get("temperature", self.temperature),
-            timeout=self.timeout,
-            **self.kwargs,
+            model=model,
+            temperature=temperature,
+            timeout=timeout,
+            max_output_tokens=max_output_tokens,
+            **merged_kwargs,
         )

@@ -17,9 +17,11 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from contextlib import contextmanager
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import StrEnum
+from html import unescape
 from pathlib import Path
 from typing import Any, Literal
 
@@ -190,7 +192,7 @@ class ReferenceExecutionResult(BaseModel):
 
 class ReferencePlanGenerator:
     AGENT_NAME = "REFERENCE_PLAN_GENERATOR"
-    AGENT_VERSION = "1.2.0"
+    AGENT_VERSION = "1.4.0"
     STAGE_NAME = "REFERENCE_PLAN_GENERATION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "ETL_REFERENCE_RELATIONAL_IR"
@@ -240,14 +242,15 @@ fields. Never place commentary, rationale, business interpretation, harmless
 observations, or confirmed behavior in assumptions. If there is no material
 evidence gap, return an empty assumptions list.
 
-Select comparison keys only from stable record-identity fields that exist in
-both source and target, are non-nullable in both schemas, and pass through
-unchanged. Never use derived fields, transformed fields, measures, balances,
+Select comparison keys from grounded stable output identity. For row-preserving
+mappings, use fields that exist in both source and target, are non-nullable, and
+pass through unchanged. For AGGREGATE mappings, the grounded GROUP BY fields are
+the output identity and may be used as comparison keys when present and
+non-nullable in the target. Never use aggregate measures, balances,
 descriptions, timestamps, nullable fields, or all output columns merely to
 create uniqueness. Prefer explicit primary keys, business keys, connector keys,
-or fields named as identifiers in canonical evidence. If no grounded stable
-identity key exists, create a MISSING_METADATA assumption instead of inventing
-one.
+or grounded GROUP BY keys. Create a MISSING_METADATA assumption only when no
+stable row identity or stable aggregate-group identity can be established.
 
 Use PASSTHROUGH only for a grounded stage, instance, or connector boundary
 that preserves every row and field unchanged while assigning a new output_name.
@@ -356,6 +359,8 @@ class SafeExpression:
         "MONTH",
         "DAY",
         "CASE",
+        "IF_ELSE",
+        "VALIDATION_NOW",
     }
     _BIN_OPS = {
         ast.Add: operator.add,
@@ -379,14 +384,40 @@ class SafeExpression:
 
     @classmethod
     def normalize(cls, expression: str) -> str:
+        """Normalize a constrained subset of PowerCenter/SQL expressions."""
         text = expression.strip()
+        for _ in range(4):
+            decoded = unescape(text)
+            if decoded == text:
+                break
+            text = decoded
+        case_pattern = re.compile(
+            r"^CASE\s+WHEN\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+?)\s+END$",
+            flags=re.I | re.S,
+        )
+        match = case_pattern.match(text)
+        if match:
+            text = f"if_else({match.group(1)}, {match.group(2)}, {match.group(3)})"
+        text = re.sub(r"\bSYSDATE\b", "validation_now()", text, flags=re.I)
+        text = re.sub(
+            r"\bNOT\s+IN\s*\(([^()]*)\)",
+            lambda item: f" not in [{item.group(1)}]",
+            text,
+            flags=re.I,
+        )
+        text = re.sub(
+            r"\bIN\s*\(([^()]*)\)",
+            lambda item: f" in [{item.group(1)}]",
+            text,
+            flags=re.I,
+        )
         text = re.sub(r"\bAND\b", " and ", text, flags=re.I)
         text = re.sub(r"\bOR\b", " or ", text, flags=re.I)
         text = re.sub(r"\bNOT\b", " not ", text, flags=re.I)
         text = re.sub(r"\bNULL\b", "None", text, flags=re.I)
-        text = re.sub(r"(?<![<>=!])=(?!=)", "==", text)
         text = text.replace("<>", "!=")
-        return text
+        text = re.sub(r"(?<![<>=!])=(?!=)", "==", text)
+        return " ".join(text.split())
 
     @classmethod
     def validate(cls, expression: str, allowed_fields: set[str]) -> list[str]:
@@ -527,8 +558,17 @@ class SafeExpression:
             if isinstance(value, str):
                 value = datetime.fromisoformat(value).date()
             return getattr(value, name.lower())
-        if name == "CASE":
+        if name in {"CASE", "IF_ELSE"}:
+            if len(args) != 3:
+                raise ValueError(f"{name} requires condition, true value, and false value.")
             return args[1] if bool(args[0]) else args[2]
+        if name == "VALIDATION_NOW":
+            if args:
+                raise ValueError("VALIDATION_NOW accepts no arguments.")
+            # One deterministic timestamp is used by the reference executor.
+            # Runtime ETL timestamps remain excluded from strict value matching
+            # unless explicitly configured as comparison fields.
+            return datetime(2000, 1, 1, 0, 0, 0)
         if name in {"DATE_ADD", "DATE_DIFF"}:
             raise ValueError(f"{name} requires explicit platform-neutral date semantics.")
         raise ValueError(f"Unsupported function: {name}")
@@ -536,7 +576,7 @@ class SafeExpression:
 
 class ReferencePlanValidator:
     AGENT_NAME = "REFERENCE_PLAN_VALIDATOR"
-    AGENT_VERSION = "1.2.0"
+    AGENT_VERSION = "1.3.0"
     STAGE_NAME = "REFERENCE_PLAN_VALIDATION"
     MODEL_NAME = "DETERMINISTIC_IR_VALIDATOR"
 
@@ -608,11 +648,17 @@ class ReferencePlanValidator:
                     issues.append(ReferencePlanIssue(code="UNKNOWN_COLUMNS", message=f"Unknown projected columns: {sorted(unknown)}", operation_id=operation_id))
                 output_fields = set(operation_item.columns)
             elif kind == "RENAME":
-                if operation_item.rename_from not in fields or not operation_item.rename_to:
-                    issues.append(ReferencePlanIssue(code="INVALID_RENAME", message="RENAME requires an existing source and target field.", operation_id=operation_id))
+                source_field = operation_item.rename_from
+                target_field = operation_item.rename_to
+                if not source_field or not target_field:
+                    issues.append(ReferencePlanIssue(code="INVALID_RENAME", message="RENAME requires source and target field names.", operation_id=operation_id))
+                elif source_field in fields:
+                    output_fields.discard(source_field)
+                    output_fields.add(target_field)
+                elif target_field in fields:
+                    output_fields = set(fields)
                 else:
-                    output_fields.discard(operation_item.rename_from)
-                    output_fields.add(operation_item.rename_to)
+                    issues.append(ReferencePlanIssue(code="INVALID_RENAME", message=f"Cannot rename {source_field} to {target_field}; source is absent and target was not produced.", operation_id=operation_id))
             elif kind == "JOIN":
                 if not operation_item.right_input_name or operation_item.right_input_name not in available:
                     issues.append(ReferencePlanIssue(code="UNKNOWN_RIGHT_INPUT", message="JOIN requires a known right input.", operation_id=operation_id))
@@ -662,23 +708,17 @@ class ReferencePlanValidator:
                 issues.append(ReferencePlanIssue(code="EXTRA_OUTPUT_FIELDS", message=f"Plan output has extra fields: {sorted(extra)}"))
 
         source_fields = set().union(*datasets.values()) if datasets else set()
-        invalid_keys = set(plan.comparison_keys) - (source_fields & target_fields)
+        invalid_keys = set(plan.comparison_keys) - target_fields
         if invalid_keys:
             issues.append(
                 ReferencePlanIssue(
                     code="INVALID_COMPARISON_KEYS",
-                    message=f"Comparison keys do not exist in source and target: {sorted(invalid_keys)}",
+                    message=f"Comparison keys do not exist in final target output: {sorted(invalid_keys)}",
                 )
             )
 
-        derived_keys = set(plan.comparison_keys) & derived_fields
-        if derived_keys:
-            issues.append(
-                ReferencePlanIssue(
-                    code="DERIVED_COMPARISON_KEYS",
-                    message=f"Comparison keys must pass through unchanged: {sorted(derived_keys)}",
-                )
-            )
+        # Derived or renamed target keys are valid when they exist in the final
+        # output. MatchFlow compares target rows, not raw-source column names.
 
         nullable_keys = {
             key
@@ -700,8 +740,40 @@ class ReferencePlanValidator:
                 )
             )
 
-        blocking_assumptions = list(plan.assumptions)
-        assumption_descriptions = [item.description for item in blocking_assumptions]
+        aggregate_group_keys = {
+            key
+            for operation_item in plan.operations
+            if operation_item.operation == "AGGREGATE"
+            for key in operation_item.group_by
+        }
+        aggregate_identity_is_grounded = bool(aggregate_group_keys) and set(
+            plan.comparison_keys
+        ).issubset(aggregate_group_keys) and set(plan.comparison_keys).issubset(
+            target_fields
+        )
+
+        identity_gap_markers = (
+            "stable record-identity",
+            "stable record identity",
+            "record-identity key",
+            "record identity key",
+            "source-to-target identity",
+            "source to target identity",
+        )
+        blocking_assumptions = [
+            assumption
+            for assumption in plan.assumptions
+            if not (
+                aggregate_identity_is_grounded
+                and any(
+                    marker in assumption.description.lower()
+                    for marker in identity_gap_markers
+                )
+            )
+        ]
+        assumption_descriptions = [
+            item.description for item in blocking_assumptions
+        ]
         full_coverage = not issues and not unsupported and not blocking_assumptions
         safe_to_execute = not issues and not unsupported
         return ReferencePlanValidationResult(
@@ -716,9 +788,65 @@ class ReferencePlanValidator:
 
 class RelationalIRExecutor:
     AGENT_NAME = "REFERENCE_EXECUTION_COORDINATOR"
-    AGENT_VERSION = "1.1.0"
+    AGENT_VERSION = "1.4.0"
     STAGE_NAME = "REFERENCE_EXECUTION"
     MODEL_NAME = "DETERMINISTIC_RELATIONAL_IR"
+
+    @staticmethod
+    def _coerce_reference_value(value: Any, field: Any) -> Any:
+        """Convert serialized source values using canonical field metadata."""
+        if value is None:
+            return None
+        data_type = str(getattr(field, "data_type", "") or "").strip().lower()
+        if any(token in data_type for token in ("decimal", "numeric", "number")):
+            return Decimal(str(value))
+        if any(token in data_type for token in (
+            "bigint", "integer", "smallint", "tinyint", "int32", "int64", "long",
+        )) or data_type == "int":
+            return int(Decimal(str(value)))
+        if any(token in data_type for token in ("double", "float", "real")):
+            return float(value)
+        if data_type in {"bool", "boolean"}:
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"true", "1", "yes", "y"}
+        if data_type == "date":
+            if isinstance(value, datetime):
+                return value.date()
+            if hasattr(value, "year") and not isinstance(value, str):
+                return value
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+        if any(token in data_type for token in ("timestamp", "datetime", "date/time")):
+            if isinstance(value, datetime):
+                return value
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return value
+
+    @classmethod
+    def _coerce_reference_inputs(
+        cls,
+        mapping: CanonicalMapping,
+        input_datasets: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Coerce each named source independently before relational execution."""
+        schemas = {
+            dataset.name: {field.name: field for field in dataset.fields}
+            for dataset in mapping.sources
+        }
+        result: dict[str, list[dict[str, Any]]] = {}
+        for dataset_name, rows in input_datasets.items():
+            field_models = schemas.get(dataset_name)
+            if field_models is None:
+                result[dataset_name] = [dict(row) for row in rows]
+                continue
+            converted_rows: list[dict[str, Any]] = []
+            for row in rows:
+                converted_rows.append({
+                    name: cls._coerce_reference_value(row.get(name), field)
+                    for name, field in field_models.items()
+                })
+            result[dataset_name] = converted_rows
+        return result
 
     def run(
         self,
@@ -751,15 +879,32 @@ class RelationalIRExecutor:
                 error_message="Synthetic data was not supplied for every referenced source dataset.",
             )
         try:
-            datasets = {name: [dict(row) for row in rows] for name, rows in input_datasets.items()}
+            datasets = self._coerce_reference_inputs(mapping, input_datasets)
             for operation_item in plan.operations:
                 datasets[operation_item.output_name] = self._execute_operation(operation_item, datasets)
-            rows = datasets[plan.output_name]
-            target_fields = [field.name for dataset in mapping.targets for field in dataset.fields]
+            reference_rows = datasets[plan.output_name]
+            # Evaluate behavioral invariants against the relevant intermediate
+            # operation boundary. A later PROJECT may remove predicate fields.
+            invariants = self._invariants(
+                plan=plan,
+                final_rows=reference_rows,
+                datasets=datasets,
+            )
+            failed_invariants = [
+                item for item in invariants if not item["passed"]
+            ]
+
+            target_fields = [
+                field.name
+                for dataset in mapping.targets
+                for field in dataset.fields
+            ]
+            rows = reference_rows
             if target_fields:
-                rows = [{field: row.get(field) for field in target_fields} for row in rows]
-            invariants = self._invariants(plan, rows)
-            failed_invariants = [item for item in invariants if not item["passed"]]
+                rows = [
+                    {field: row.get(field) for field in target_fields}
+                    for row in reference_rows
+                ]
             return ReferenceExecutionResult(
                 status="PASSED" if not failed_invariants else "FAILED",
                 rows=rows,
@@ -882,28 +1027,148 @@ class RelationalIRExecutor:
         return output
 
     @staticmethod
-    def _invariants(plan: ReferencePlan, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _normalized_expression(expression: str | None) -> str:
+        return re.sub(r"\s+", "", expression or "").lower()
+
+    @classmethod
+    def _predicate_invariant(
+        cls,
+        invariant: ReferenceInvariant,
+        plan: ReferencePlan,
+        datasets: dict[str, list[dict[str, Any]]],
+        operation_types: set[str],
+    ) -> tuple[bool, str]:
+        """Validate a predicate at its operation boundary, before projection."""
+        expression = invariant.expression
+        if not expression:
+            return False, "Predicate invariant has no expression."
+
+        normalized = cls._normalized_expression(expression)
+        candidates = [
+            operation
+            for operation in plan.operations
+            if operation.operation in operation_types
+            and operation.input_name in datasets
+            and operation.output_name in datasets
+        ]
+        exact = [
+            operation
+            for operation in candidates
+            if cls._normalized_expression(operation.condition) == normalized
+        ]
+        selected = exact or candidates
+        if not selected:
+            return False, "No compatible predicate operation boundary was found."
+
+        for operation in selected:
+            input_rows = datasets[operation.input_name]
+            output_rows = datasets[operation.output_name]
+            expected_rows = [
+                row
+                for row in input_rows
+                if bool(SafeExpression.evaluate(expression, row))
+            ]
+
+            keys = list(plan.comparison_keys)
+            if keys and all(
+                all(key in row for key in keys)
+                for row in expected_rows + output_rows
+            ):
+                expected_keys = [
+                    tuple(row.get(key) for key in keys)
+                    for row in expected_rows
+                ]
+                actual_keys = [
+                    tuple(row.get(key) for key in keys)
+                    for row in output_rows
+                ]
+                passed = sorted(map(repr, expected_keys)) == sorted(map(repr, actual_keys))
+            else:
+                # Deterministic structural fallback for plans whose identity is
+                # created after the predicate boundary.
+                canonical = lambda row: json.dumps(row, sort_keys=True, default=str)
+                passed = sorted(map(canonical, expected_rows)) == sorted(
+                    map(canonical, output_rows)
+                )
+
+            if passed:
+                return True, (
+                    f"Predicate verified at {operation.operation_id} "
+                    f"({operation.input_name} -> {operation.output_name})."
+                )
+
+        return False, "Predicate output does not equal the eligible input rows."
+
+    @classmethod
+    def _invariants(
+        cls,
+        plan: ReferencePlan,
+        final_rows: list[dict[str, Any]],
+        datasets: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         for invariant in plan.invariants:
             passed = True
             details = invariant.description
+            evaluation_details: str | None = None
+
             if invariant.invariant_type == "OUTPUT_SCHEMA":
-                passed = all(set(invariant.fields).issubset(row) for row in rows)
+                passed = all(
+                    set(invariant.fields).issubset(row)
+                    for row in final_rows
+                )
             elif invariant.invariant_type == "UNIQUE_KEYS":
-                keys = [tuple(row.get(field) for field in invariant.fields) for row in rows]
+                keys = [
+                    tuple(row.get(field) for field in invariant.fields)
+                    for row in final_rows
+                ]
                 passed = len(keys) == len(set(keys))
             elif invariant.invariant_type == "NON_NULL":
-                passed = all(all(row.get(field) is not None for field in invariant.fields) for row in rows)
-            elif invariant.invariant_type in {"FILTER_PREDICATE", "EXPRESSION_PREDICATE"}:
-                passed = bool(invariant.expression) and all(bool(SafeExpression.evaluate(invariant.expression or "False", row)) for row in rows)
+                passed = all(
+                    all(row.get(field) is not None for field in invariant.fields)
+                    for row in final_rows
+                )
+            elif invariant.invariant_type == "FILTER_PREDICATE":
+                passed, evaluation_details = cls._predicate_invariant(
+                    invariant,
+                    plan,
+                    datasets,
+                    {"FILTER", "ROUTE"},
+                )
+            elif invariant.invariant_type == "EXPRESSION_PREDICATE":
+                # Expression predicates are evaluated at DERIVE or routing
+                # boundaries, not only against the final projected schema.
+                passed, evaluation_details = cls._predicate_invariant(
+                    invariant,
+                    plan,
+                    datasets,
+                    {"DERIVE", "FILTER", "ROUTE"},
+                )
             elif invariant.invariant_type == "SORT_ORDER":
-                keys = [tuple(row.get(field) for field in invariant.fields) for row in rows]
+                keys = [
+                    tuple(row.get(field) for field in invariant.fields)
+                    for row in final_rows
+                ]
                 passed = keys == sorted(keys)
+            elif invariant.invariant_type == "ROW_COUNT_PRESERVED":
+                if plan.operations:
+                    first_input = datasets.get(plan.operations[0].input_name, [])
+                    passed = len(final_rows) == len(first_input)
+                else:
+                    passed = True
+            elif invariant.invariant_type == "ROW_COUNT_NON_INCREASING":
+                if plan.operations:
+                    first_input = datasets.get(plan.operations[0].input_name, [])
+                    passed = len(final_rows) <= len(first_input)
+                else:
+                    passed = True
+
             results.append({
                 "invariant_id": invariant.invariant_id,
                 "invariant_type": invariant.invariant_type,
                 "passed": passed,
                 "details": details,
+                "evaluation_details": evaluation_details,
             })
         return results
 
@@ -1024,7 +1289,12 @@ class SyntheticTestDataGenerator:
     async def run(self, mapping: CanonicalMapping, discovery: dict, lineage: dict) -> SyntheticTestDataResult:
         prompt = """Generate fictional, non-sensitive ETL validation scenarios and
 synthetic input rows using only the supplied canonical evidence. Never invent
-columns. Use comparison keys present in both source and target. Keep key values
+columns. For multi-source mappings, each semantic row must include every
+non-nullable field required by every source dataset and preserve values shared
+by connector-grounded join keys. A row is a logical scenario envelope; the
+backend will deterministically project the envelope into one row per named
+source dataset. Use comparison keys that resolve through canonical connectors
+to final target fields. Keep key values
 populated and unique across rows. Cover happy path, every grounded business
 rule, filter rejection when applicable, nullable fields when applicable, and
 relevant boundaries. Preserve source_expression exactly. Keep decimal values
@@ -1039,7 +1309,19 @@ Integer fields with precision above 9 may use signed 64-bit values but must
 remain between -9223372036854775808 and 9223372036854775807. Keep comparison
 keys unique across every generated row unless canonical evidence explicitly
 contains duplicate-handling behavior. Generate a DUPLICATE_KEY scenario only
-when a grounded deduplication, rank, distinct, or aggregation rule exists."""
+when a grounded deduplication, rank, distinct, or aggregation rule exists.
+Scenario categories describe exercised behavior, not only the input shape. For
+row-selection behavior such as filter, router, validation reject, lookup miss,
+join non-match, conditional exclusion, or quarantine, include a scenario with
+category NEGATIVE. A scenario is negative when its expected behavior excludes,
+rejects, drops, suppresses, quarantines, or emits no output row. A nullable or
+boundary scenario may also cover negative behavior when rejection is its stated
+expected outcome. When nullable fields are relevant to filtering, derivation,
+routing, validation, lookup, aggregation, or target behavior, include a null
+case. Use NULL_HANDLING when null processing is the primary purpose. A scenario
+in any category still covers null behavior when an input cell is null or its
+expected behavior explicitly describes retaining, defaulting, rejecting,
+filtering, or transforming a null or missing value."""
         evidence = {
             "canonical_mapping": mapping.model_dump(mode="json"),
             "business_rules": discovery.get("business_rules", []),
@@ -1093,9 +1375,87 @@ class SyntheticDataValidationResult(BaseModel):
 
 class SyntheticDataValidator:
     AGENT_NAME = "SYNTHETIC_DATA_VALIDATOR"
-    AGENT_VERSION = "1.2.0"
+    AGENT_VERSION = "1.4.0"
     STAGE_NAME = "SYNTHETIC_DATA_VALIDATION"
     MODEL_NAME = "DETERMINISTIC_SCHEMA"
+
+    NEGATIVE_CATEGORY_ALIASES = {
+        "NEGATIVE", "NEGATIVE_TEST", "REJECTION", "REJECTED",
+        "EXCLUSION", "EXCLUDED", "FILTERED_OUT", "FILTER_REJECT",
+        "INVALID_INPUT", "NON_MATCH", "NO_MATCH", "QUARANTINE", "DROPPED",
+    }
+    NEGATIVE_BEHAVIOR_PATTERNS = (
+        r"\bshould\s+not\b", r"\bmust\s+not\b", r"\bwill\s+not\b",
+        r"\bnot\s+(?:be\s+)?(?:loaded|written|inserted|emitted|returned|present|included|processed|retained)\b",
+        r"\bfilter(?:ed)?\s+out\b", r"\bexclude(?:d|s|ing)?\b",
+        r"\breject(?:ed|s|ing)?\b", r"\bdrop(?:ped|s|ping)?\b",
+        r"\bsuppress(?:ed|es|ing)?\b", r"\bquarantin(?:e|ed|es|ing)\b",
+        r"\bdiscard(?:ed|s|ing)?\b", r"\bignore(?:d|s|ing)?\b",
+        r"\bno\s+(?:target|output)\s+(?:row|record)\b",
+        r"\bzero\s+(?:target|output)\s+(?:rows|records)\b",
+        r"\bnon[- ]?match(?:ing)?\b",
+        r"\bfails?\s+(?:the\s+)?(?:filter|condition|validation|rule)\b",
+    )
+
+    NULL_CATEGORY_ALIASES = {
+        "NULL", "NULL_CASE", "NULL_TEST", "NULL_HANDLING",
+        "MISSING_VALUE", "MISSING_DATA", "ABSENT_VALUE", "EMPTY_VALUE",
+        "OPTIONAL_FIELD", "DEFAULT_VALUE", "NULL_DEFAULT",
+    }
+    NULL_BEHAVIOR_PATTERNS = (
+        r"\bnull\b", r"\bnone\b", r"\bnullable\b",
+        r"\bmissing\s+(?:value|field|data)\b",
+        r"\babsent\s+(?:value|field|data)\b",
+        r"\bempty\s+(?:value|field)\b",
+        r"\bdefault(?:ed|ing|s)?\b", r"\bcoalesce(?:d|s|ing)?\b",
+        r"\bifnull\b", r"\bisnull\b", r"\bnot\s+null\b",
+    )
+
+    @classmethod
+    def _normalized_category(cls, category: Any) -> str:
+        value = re.sub(r"[^A-Z0-9]+", "_", str(category or "").strip().upper())
+        return value.strip("_")
+
+    @classmethod
+    def _scenario_text(cls, scenario: SyntheticScenario) -> str:
+        return " ".join(str(value) for value in (
+            scenario.title, scenario.description, scenario.expected_behavior,
+            scenario.source_expression,
+        ) if value).strip().lower()
+
+    @classmethod
+    def _covers_negative_behavior(cls, scenario: SyntheticScenario) -> bool:
+        """Recognize grounded rejection behavior without trusting one label."""
+        if cls._normalized_category(scenario.category) in cls.NEGATIVE_CATEGORY_ALIASES:
+            return True
+        text = cls._scenario_text(scenario)
+        return any(re.search(pattern, text, re.IGNORECASE) for pattern in cls.NEGATIVE_BEHAVIOR_PATTERNS)
+
+    @classmethod
+    def _covers_null_behavior(cls, scenario: SyntheticScenario) -> bool:
+        """Recognize null behavior from category, input data, or semantics."""
+        if cls._normalized_category(scenario.category) in cls.NULL_CATEGORY_ALIASES:
+            return True
+        if any(
+            cell.value is None
+            for input_row in scenario.input_rows
+            for cell in input_row.cells
+        ):
+            return True
+        text = cls._scenario_text(scenario)
+        return any(
+            re.search(pattern, text, re.IGNORECASE)
+            for pattern in cls.NULL_BEHAVIOR_PATTERNS
+        )
+
+    @staticmethod
+    def _mapping_requires_negative_coverage(mapping: CanonicalMapping) -> bool:
+        """Detect generic transformations capable of excluding records."""
+        tokens = (
+            "filter", "router", "route", "reject", "validation", "lookup",
+            "join", "anti", "except", "minus", "dedup", "distinct", "qualify",
+        )
+        return any(any(token in (item.transformation_type or "").strip().lower() for token in tokens) for item in mapping.transformations)
 
     def run(
         self,
@@ -1128,11 +1488,35 @@ class SyntheticDataValidator:
             for transformation in mapping.transformations
         )
 
-        keys_ok = bool(generated.comparison_keys) and all(key in fields and key in target_fields for key in generated.comparison_keys)
+        connector_renames = {
+            connector.from_field: connector.to_field
+            for connector in mapping.connectors
+            if connector.from_field and connector.to_field
+        }
+        resolved_keys = [
+            key if key in target_fields else connector_renames.get(key)
+            for key in generated.comparison_keys
+        ]
+        keys_ok = bool(resolved_keys) and all(
+            key in target_fields for key in resolved_keys if key is not None
+        ) and all(key is not None for key in resolved_keys)
+        target_instances = {target.name for target in mapping.targets}
+        target_to_source_key = {
+            connector.to_field: connector.from_field
+            for connector in mapping.connectors
+            if connector.to_instance in target_instances
+            and connector.to_field
+            and connector.from_field
+        }
+        validation_keys = [
+            key if key in fields else target_to_source_key.get(key)
+            for key in generated.comparison_keys
+        ]
+        validation_keys = [key for key in validation_keys if key in fields]
         checks.append(SyntheticDataCheck(
             check_name="COMPARISON_KEYS",
             passed=keys_ok,
-            details="Comparison keys exist in source and target." if keys_ok else "Invalid comparison keys.",
+            details="Comparison keys resolve to final target fields." if keys_ok else "Invalid comparison keys.",
         ))
 
         for scenario in generated.scenarios:
@@ -1173,7 +1557,7 @@ class SyntheticDataValidator:
             if keys_ok:
                 key = tuple(
                     "" if row.get(name) is None else str(row[name])
-                    for name in generated.comparison_keys
+                    for name in validation_keys
                 )
                 if "" in key:
                     schema_errors.append(f"{row_id}: null comparison key")
@@ -1200,7 +1584,8 @@ class SyntheticDataValidator:
 
         max_scenarios = int(getattr(settings, "synthetic_validation_max_scenarios", 30))
         max_rows = int(getattr(settings, "synthetic_validation_max_rows", 250))
-        bounded = 0 < len(generated.scenarios) <= max_scenarios and 0 < row_count <= max_rows
+        row_limit_ok = row_count > 0 if physical_rows is not None else row_count <= max_rows
+        bounded = 0 < len(generated.scenarios) <= max_scenarios and row_limit_ok
         checks.append(SyntheticDataCheck(
             check_name="BOUNDED_DATA", passed=bounded,
             details=f"Generated {len(generated.scenarios)} scenarios and {row_count} rows." if bounded else "Configured limits exceeded.",
@@ -1211,22 +1596,46 @@ class SyntheticDataValidator:
             details="All rows conform to canonical metadata." if schema_ok else "; ".join(schema_errors[:30]),
         ))
 
-        categories = {scenario.category for scenario in generated.scenarios}
+        categories = {
+            self._normalized_category(scenario.category)
+            for scenario in generated.scenarios
+        }
         required = {"HAPPY_PATH"}
-        if discovery.get("business_rules"):
-            required.add("BUSINESS_RULE")
-        if any("filter" in item.transformation_type.lower() for item in mapping.transformations):
-            required.add("NEGATIVE")
-        if any(field.nullable for field in fields.values()):
+        covered = set(categories)
+
+        null_required = any(field.nullable for field in fields.values())
+        null_covered = any(
+            self._covers_null_behavior(scenario)
+            for scenario in generated.scenarios
+        )
+        if null_required:
             required.add("NULL_HANDLING")
-        missing_categories = required - categories
+        if null_covered:
+            covered.add("NULL_HANDLING")
+
+        negative_required = self._mapping_requires_negative_coverage(mapping)
+        negative_covered = any(
+            self._covers_negative_behavior(scenario)
+            for scenario in generated.scenarios
+        )
+        if negative_required:
+            required.add("NEGATIVE")
+        if negative_covered:
+            covered.add("NEGATIVE")
+
+        missing_categories = required - covered
         coverage_ok = not missing_categories
         checks.append(SyntheticDataCheck(
-            check_name="SCENARIO_COVERAGE", passed=coverage_ok,
-            details="Required categories are present." if coverage_ok else f"Missing categories: {sorted(missing_categories)}",
+            check_name="SCENARIO_COVERAGE",
+            passed=coverage_ok,
+            details=(
+                "Required scenario behaviors are covered."
+                if coverage_ok
+                else f"Missing scenario behaviors: {sorted(missing_categories)}"
+            ),
         ))
         passed = all(check.passed for check in checks)
-        coverage = len(required & categories) / len(required) if required else 1.0
+        coverage = len(required & covered) / len(required) if required else 1.0
         return SyntheticDataValidationResult(
             status="PASSED" if passed else "FAILED",
             checks=checks,
@@ -1240,9 +1649,19 @@ class SyntheticDataValidator:
         errors: list[str] = []
         dtype = (field.data_type or "").lower()
         try:
-            if "int" in dtype or "integer" in dtype:
+            integer_limits = ValidationAgent._integer_limits(dtype)
+            if integer_limits is not None:
                 if isinstance(value, bool) or Decimal(str(value)) != int(value):
                     errors.append(f"{test_id}: {name} is not an integer")
+                else:
+                    integer = int(Decimal(str(value)))
+                    minimum, maximum = integer_limits
+                    if not minimum <= integer <= maximum:
+                        errors.append(
+                            f"{test_id}: {name}={integer} is outside the "
+                            f"valid {field.data_type} range "
+                            f"[{minimum}, {maximum}]"
+                        )
             elif any(token in dtype for token in ("decimal", "numeric", "number", "float", "double")):
                 number = Decimal(str(value))
                 precision = len(number.as_tuple().digits)
@@ -1431,6 +1850,32 @@ class LegacyLogicExecutor:
             return text
 
 
+@contextmanager
+def sanitized_spark_environment():
+    """Temporarily expose a consistent PySpark runtime to child processes.
+
+    SPARK_HOME must be absent, not an empty string. PySpark interprets an empty
+    SPARK_HOME as the current directory and attempts to run ./bin/spark-submit.
+    """
+    managed_keys = (
+        "SPARK_HOME",
+        "PYSPARK_PYTHON",
+        "PYSPARK_DRIVER_PYTHON",
+    )
+    previous = {key: os.environ.get(key) for key in managed_keys}
+    try:
+        os.environ.pop("SPARK_HOME", None)
+        os.environ["PYSPARK_PYTHON"] = sys.executable
+        os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 class TargetExecutionResult(BaseModel):
     status: Literal["PASSED", "FAILED", "SKIPPED"]
     rows: list[dict[str, Any]] = Field(default_factory=list)
@@ -1447,71 +1892,138 @@ class TargetPySparkExecutor:
     MODEL_NAME = "ISOLATED_PYSPARK_SUBPROCESS"
 
     HARNESS = """import importlib.util, json, sys
+from datetime import date, datetime
 from decimal import Decimal
 from pyspark.sql import SparkSession
-from pyspark.sql.types import DecimalType, IntegerType, LongType, DoubleType, StringType, BooleanType, StructField, StructType
-code_path, input_path, schema_path, output_path = sys.argv[1:]
-rows = json.load(open(input_path, encoding='utf-8'))
-specification = json.load(open(schema_path, encoding='utf-8'))
-def spark_type(field):
-    dtype = str(field.get('data_type', 'string')).lower()
-    if any(x in dtype for x in ('decimal','numeric','number')): return DecimalType(int(field.get('precision') or 38), int(field.get('scale') or 0))
-    if 'bigint' in dtype or 'long' in dtype:
-        return LongType()
-    if 'int' in dtype or 'integer' in dtype:
-        precision = field.get('precision')
-        if precision is not None and int(precision) > 9:
-            return LongType()
-        return IntegerType()
-    if 'double' in dtype or 'float' in dtype: return DoubleType()
-    if 'bool' in dtype: return BooleanType()
+from pyspark.sql.types import *
+
+def dtype(field):
+    name = str(field.get('data_type', 'string')).lower()
+    if name in {'int', 'integer', 'int32'}: return IntegerType()
+    if name in {'bigint', 'long', 'int64'}: return LongType()
+    if name in {'double', 'float'}: return DoubleType()
+    if name in {'boolean', 'bool'}: return BooleanType()
+    if name in {'date'}: return DateType()
+    if name in {'timestamp', 'datetime'}: return TimestampType()
+    if any(token in name for token in ('decimal', 'numeric', 'number')):
+        precision_value = field.get('precision')
+        scale_value = field.get('scale')
+        precision = 38 if precision_value is None else int(precision_value)
+        scale = 18 if scale_value is None else int(scale_value)
+        if precision < 1 or precision > 38:
+            raise ValueError(f'Invalid decimal precision {precision} for {field.get("name")}')
+        if scale < 0 or scale > precision:
+            raise ValueError(f'Invalid decimal scale {scale} for {field.get("name")}')
+        return DecimalType(precision, scale)
     return StringType()
-schema = StructType([StructField(field['name'], spark_type(field), bool(field.get('nullable', True))) for field in specification])
-for row in rows:
-    for field in specification:
-        name, dtype = field['name'], str(field.get('data_type','')).lower()
-        if row.get(name) is not None and any(x in dtype for x in ('decimal','numeric','number')): row[name] = Decimal(str(row[name]))
-module_spec = importlib.util.spec_from_file_location('generated_mapping', code_path)
-module = importlib.util.module_from_spec(module_spec)
-module_spec.loader.exec_module(module)
+
+def convert_value(value, spark_type):
+    if value is None:
+        return None
+    if isinstance(spark_type, DecimalType):
+        return Decimal(str(value))
+    if isinstance(spark_type, DateType):
+        if isinstance(value, date) and not isinstance(value, datetime):
+            return value
+        return date.fromisoformat(str(value)[:10])
+    if isinstance(spark_type, TimestampType):
+        if isinstance(value, datetime):
+            return value
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    if isinstance(spark_type, (IntegerType, LongType, ShortType, ByteType)):
+        return int(value)
+    if isinstance(spark_type, (FloatType, DoubleType)):
+        return float(value)
+    if isinstance(spark_type, BooleanType):
+        return value if isinstance(value, bool) else str(value).strip().lower() in {'true', '1', 'yes'}
+    return str(value) if isinstance(spark_type, StringType) else value
+
+def convert_rows(rows, fields):
+    spark_types = {str(field['name']): dtype(field) for field in fields}
+    return [
+        {
+            name: convert_value(row.get(name), spark_type)
+            for name, spark_type in spark_types.items()
+        }
+        for row in rows
+    ]
+
+def schema(fields):
+    return StructType([StructField(str(f['name']), dtype(f), bool(f.get('nullable', True))) for f in fields])
+
+code_path, input_path, schema_path, output_path = sys.argv[1:5]
+inputs_payload = json.load(open(input_path, encoding='utf-8'))
+schemas_payload = json.load(open(schema_path, encoding='utf-8'))
+spec = importlib.util.spec_from_file_location('generated_transform', code_path)
+module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
 transform = getattr(module, 'transform', None)
-if transform is None: raise RuntimeError('Generated artifact must expose transform(DataFrame).')
+if transform is None: raise RuntimeError('Generated artifact must expose transform(inputs).')
 spark = SparkSession.builder.master('local[1]').appName('neuflow-validation').getOrCreate()
 try:
-    output = transform(spark.createDataFrame(rows, schema=schema))
+    frames = {
+        name: spark.createDataFrame(
+            convert_rows(rows, schemas_payload[name]),
+            schema=schema(schemas_payload[name]),
+        )
+        for name, rows in inputs_payload.items()
+    }
+    output = transform(frames)
     json.dump([item.asDict(recursive=True) for item in output.collect()], open(output_path, 'w', encoding='utf-8'), default=str)
 finally:
     spark.stop()
 """
 
-    def run(self, code_path: Path, mapping: CanonicalMapping, rows: list[dict], timeout: int) -> TargetExecutionResult:
+    def run(self, code_path: Path, mapping: CanonicalMapping, input_datasets: dict[str, list[dict]], timeout: int) -> TargetExecutionResult:
         try:
             with tempfile.TemporaryDirectory(prefix="neuflow-target-") as temp:
                 directory = Path(temp)
                 input_path, schema_path = directory / "input.json", directory / "schema.json"
                 output_path, harness_path = directory / "output.json", directory / "harness.py"
-                input_path.write_text(json.dumps(rows, default=str), encoding="utf-8")
-                schema = [field.model_dump(mode="json") for dataset in mapping.sources for field in dataset.fields]
-                schema_path.write_text(json.dumps(schema, default=str), encoding="utf-8")
+                input_path.write_text(json.dumps(input_datasets, default=str), encoding="utf-8")
+                schemas = {
+                    dataset.name: [field.model_dump(mode="json") for field in dataset.fields]
+                    for dataset in mapping.sources
+                }
+                schema_path.write_text(json.dumps(schemas, default=str), encoding="utf-8")
                 harness_path.write_text(self.HARNESS, encoding="utf-8")
                 allowed_keys = {
-                    "PATH", "JAVA_HOME", "SPARK_HOME", "HADOOP_HOME",
+                    "PATH", "JAVA_HOME", "HADOOP_HOME",
                     "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "TMPDIR",
                     "USERPROFILE", "HOME", "LOCALAPPDATA", "APPDATA",
                 }
                 environment = {
                     key: value
                     for key, value in os.environ.items()
-                    if key.upper() in allowed_keys
+                    if key.upper() in allowed_keys and value
                 }
+                existing_pythonpath = os.environ.get("PYTHONPATH", "")
                 environment.update({
-                    "PYTHONPATH": str(code_path.parent),
+                    "PYTHONPATH": os.pathsep.join(
+                        value
+                        for value in (str(code_path.parent), existing_pythonpath)
+                        if value
+                    ),
                     "PYTHONIOENCODING": "utf-8",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYSPARK_PYTHON": sys.executable,
                     "PYSPARK_DRIVER_PYTHON": sys.executable,
                 })
-                completed = subprocess.run([sys.executable, str(harness_path), str(code_path), str(input_path), str(schema_path), str(output_path)], capture_output=True, text=True, timeout=timeout, env=environment, check=False)
+                environment.pop("SPARK_HOME", None)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(harness_path),
+                        str(code_path),
+                        str(input_path),
+                        str(schema_path),
+                        str(output_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=environment,
+                    check=False,
+                )
                 if completed.returncode != 0:
                     return TargetExecutionResult(status="FAILED", stdout=completed.stdout[-10000:], stderr=completed.stderr[-10000:], error_message=(completed.stderr or completed.stdout)[-4000:])
                 output = json.loads(output_path.read_text(encoding="utf-8"))
@@ -1597,73 +2109,427 @@ class ValidationDataStore:
 
 class ValidationAgent:
     AGENT_NAME = "VALIDATION_AGENT"
-    AGENT_VERSION = "3.4.0"
+    AGENT_VERSION = "4.8.0"
     STAGE_NAME = "ZERO_TOUCH_VALIDATION"
     MODEL_NAME = "HYBRID_GPT4O_DETERMINISTIC"
 
     @staticmethod
+    def _integer_limits(data_type: str) -> tuple[int, int] | None:
+        """Return Spark-compatible signed integer limits for a canonical type."""
+        normalized = (data_type or "").strip().lower()
+        if any(token in normalized for token in ("bigint", "int64", "long")):
+            return -(2**63), (2**63) - 1
+        if normalized in {
+            "int", "integer", "int32", "smallint", "short", "tinyint", "byte"
+        } or normalized.startswith("integer"):
+            if "tiny" in normalized or "byte" in normalized:
+                return -(2**7), (2**7) - 1
+            if "small" in normalized or "short" in normalized:
+                return -(2**15), (2**15) - 1
+            return -(2**31), (2**31) - 1
+        return None
+
+    @classmethod
+    def _integral_field_limits(cls, field: Any) -> tuple[int, int] | None:
+        """Return safe integral bounds for integer and zero-scale numeric fields.
+
+        PowerCenter commonly models identifiers as decimal(p, 0). Such fields
+        are integral even though their canonical type is not named INTEGER.
+        Bounds are derived from canonical precision and never exceed Spark's
+        signed 64-bit integer range used by the local validation harness.
+        """
+        data_type = str(getattr(field, "data_type", "") or "").strip().lower()
+        native_limits = cls._integer_limits(data_type)
+        if native_limits is not None:
+            return native_limits
+
+        is_numeric = any(
+            token in data_type
+            for token in ("decimal", "numeric", "number")
+        )
+        scale = int(getattr(field, "scale", 0) or 0)
+        precision = getattr(field, "precision", None)
+        if not is_numeric or scale != 0 or precision is None:
+            return None
+
+        digits = max(1, int(precision))
+        decimal_maximum = (10 ** digits) - 1
+        spark_long_maximum = (2 ** 63) - 1
+        maximum = min(decimal_maximum, spark_long_maximum)
+        return -maximum, maximum
+
+    @classmethod
+    def _coerce_schema_value(cls, value: Any, field: Any) -> tuple[bool, Any]:
+        """Coerce compatible LLM values without clamping or inventing data."""
+        if value is None:
+            return bool(field.nullable), None
+
+        dtype = (field.data_type or "").strip().lower()
+        integer_limits = cls._integral_field_limits(field)
+        try:
+            if integer_limits is not None:
+                if isinstance(value, bool):
+                    return False, value
+                number = Decimal(str(value))
+                if number != number.to_integral_value():
+                    return False, value
+                integer = int(number)
+                minimum, maximum = integer_limits
+                return minimum <= integer <= maximum, integer
+
+            if any(token in dtype for token in (
+                "decimal", "numeric", "number", "float", "double"
+            )):
+                number = Decimal(str(value))
+                precision = len(number.as_tuple().digits)
+                scale = max(-number.as_tuple().exponent, 0)
+                if field.precision is not None and precision > field.precision:
+                    return False, value
+                if field.scale is not None and scale > field.scale:
+                    return False, value
+                return True, str(number) if "decimal" in dtype else float(number)
+
+            if any(token in dtype for token in ("char", "string", "varchar")):
+                return True, value if isinstance(value, str) else str(value)
+
+            if "bool" in dtype:
+                if isinstance(value, bool):
+                    return True, value
+                normalized = str(value).strip().lower()
+                if normalized in {"true", "1", "yes", "y"}:
+                    return True, True
+                if normalized in {"false", "0", "no", "n"}:
+                    return True, False
+                return False, value
+        except (InvalidOperation, ValueError, TypeError, OverflowError):
+            return False, value
+        return True, value
+
+    @classmethod
+    def _prepare_one_dataset_rows(
+        cls,
+        semantic_rows: list[dict[str, Any]],
+        dataset: Any,
+    ) -> list[dict[str, Any]]:
+        """Project LLM-generated scenario envelopes into one canonical source.
+
+        Dataset ownership is preserved by validating only fields declared by
+        the current canonical dataset. If a semantic row is partial, values are
+        completed only from other LLM-generated rows for the same field. The
+        deterministic layer never invents business values.
+        """
+        fields = {field.name: field for field in dataset.fields}
+        generated_values: dict[str, list[Any]] = {name: [] for name in fields}
+        for row in semantic_rows:
+            for name in fields:
+                if name in row and row[name] is not None:
+                    generated_values[name].append(row[name])
+
+        prepared: list[dict[str, Any]] = []
+        for row_index, original in enumerate(semantic_rows):
+            candidate: dict[str, Any] = {}
+            valid = True
+            for name, field in fields.items():
+                value = original.get(name)
+                if value is None and name not in original:
+                    values = generated_values[name]
+                    value = values[row_index % len(values)] if values else None
+                if value is None and not field.nullable:
+                    valid = False
+                    break
+                accepted, normalized = cls._coerce_schema_value(value, field)
+                if not accepted:
+                    valid = False
+                    break
+                candidate[name] = normalized
+            if valid:
+                prepared.append(candidate)
+
+        # A source may have valid values distributed across different semantic
+        # scenarios. Build one deterministic merged row solely from values that
+        # the LLM already generated, rather than discarding the entire test set.
+        if not prepared:
+            merged: dict[str, Any] = {}
+            for name, field in fields.items():
+                values = generated_values[name]
+                value = values[0] if values else None
+                if value is None and not field.nullable:
+                    return []
+                accepted, normalized = cls._coerce_schema_value(value, field)
+                if not accepted:
+                    return []
+                merged[name] = normalized
+            prepared.append(merged)
+        return prepared
+
+    @classmethod
+    def _dataset_expansion_keys(
+        cls,
+        dataset: Any,
+        requested_keys: list[str],
+    ) -> list[str]:
+        """Choose deterministic unique keys valid for one source dataset."""
+        fields = {field.name: field for field in dataset.fields}
+        direct = [key for key in requested_keys if key in fields]
+        if direct:
+            return direct
+        preferred = [
+            field.name
+            for field in dataset.fields
+            if not field.nullable and cls._integral_field_limits(field) is not None
+        ]
+        if preferred:
+            return preferred[:1]
+        fallback = [field.name for field in dataset.fields if not field.nullable]
+        return fallback[:1]
+
+    @classmethod
+    def _prepare_parity_rows(
+        cls,
+        base_rows: list[dict[str, Any]],
+        mapping: CanonicalMapping,
+        comparison_keys: list[str],
+    ) -> list[dict[str, Any]]:
+        """Keep only canonical-schema-valid rows for runtime parity execution.
+
+        Invalid negative-test rows remain represented by the semantic scenarios
+        and deterministic validation evidence, but are not mixed into reference
+        or target execution. Unknown fields are removed, nullable missing fields
+        become null, and compatible scalar values are type-normalized.
+        """
+        source_fields = {
+            field.name: field
+            for dataset in mapping.sources
+            for field in dataset.fields
+        }
+        target_fields = {
+            field.name: field
+            for dataset in mapping.targets
+            for field in dataset.fields
+        }
+        prepared: list[dict[str, Any]] = []
+
+        for original in base_rows:
+            candidate: dict[str, Any] = {}
+            valid = True
+            for name, field in source_fields.items():
+                if name not in original:
+                    if field.nullable:
+                        candidate[name] = None
+                        continue
+                    valid = False
+                    break
+                accepted, normalized = cls._coerce_schema_value(
+                    original.get(name), field
+                )
+                if not accepted:
+                    valid = False
+                    break
+                # If the same field is constrained more narrowly in the target,
+                # reject it from parity input rather than causing cast overflow.
+                target_field = target_fields.get(name)
+                if target_field is not None and normalized is not None:
+                    target_accepted, _ = cls._coerce_schema_value(
+                        normalized, target_field
+                    )
+                    if not target_accepted:
+                        valid = False
+                        break
+                candidate[name] = normalized
+
+            if valid and all(
+                candidate.get(key) is not None and str(candidate.get(key)) != ""
+                for key in comparison_keys
+            ):
+                prepared.append(candidate)
+
+        if not prepared:
+            raise ValueError(
+                "No canonical-schema-valid semantic rows are available for "
+                "functional-parity execution."
+            )
+        return prepared
+
+    @classmethod
     def _expand_simulated_rows(
+        cls,
         base_rows: list[dict[str, Any]],
         comparison_keys: list[str],
         target_row_count: int,
+        mapping: CanonicalMapping,
     ) -> list[dict[str, Any]]:
-        """Expand semantic rows while guaranteeing unique composite keys."""
+        """Expand parity rows using unique, type-safe comparison keys."""
         if target_row_count <= 0:
             raise ValueError("Simulation target_row_count must be greater than zero.")
         if not base_rows:
-            raise ValueError("At least one semantic synthetic row is required.")
+            raise ValueError("At least one schema-valid parity row is required.")
         if not comparison_keys:
             raise ValueError("Comparison keys are required for simulation expansion.")
 
-        expanded = [dict(row) for row in base_rows[:target_row_count]]
-        used_keys: set[tuple[str, ...]] = set()
-        for row in expanded:
-            key = tuple(
-                "" if row.get(name) is None else str(row[name])
-                for name in comparison_keys
-            )
-            if "" in key:
-                raise ValueError("Semantic synthetic rows contain a null comparison key.")
-            if key in used_keys:
-                raise ValueError(f"Semantic synthetic rows contain duplicate comparison key {key}.")
-            used_keys.add(key)
+        source_fields = {
+            field.name: field
+            for dataset in mapping.sources
+            for field in dataset.fields
+        }
+        missing = [name for name in comparison_keys if name not in source_fields]
+        if missing:
+            raise ValueError("Comparison-key fields are absent from source schema: " + ", ".join(missing))
 
-        numeric_next: dict[str, int] = {}
-        for name in comparison_keys:
-            values = [
-                row.get(name)
-                for row in base_rows
-                if isinstance(row.get(name), int)
-                and not isinstance(row.get(name), bool)
-            ]
-            if values:
-                numeric_next[name] = max(values) + 1
+        expanded: list[dict[str, Any]] = []
+        used_keys: set[tuple[str, ...]] = set()
+        used_numeric: dict[str, set[int]] = {name: set() for name in comparison_keys}
+
+        def key_for(row: dict[str, Any]) -> tuple[str, ...]:
+            return tuple("" if row.get(name) is None else str(row.get(name)) for name in comparison_keys)
+
+        for original in base_rows[:target_row_count]:
+            row = dict(original)
+            key = key_for(row)
+            if "" in key or key in used_keys:
+                continue
+            used_keys.add(key)
+            expanded.append(row)
+            for name in comparison_keys:
+                value = row.get(name)
+                field = source_fields[name]
+                if cls._integral_field_limits(field) is not None:
+                    try:
+                        number = Decimal(str(value))
+                        if number == number.to_integral_value():
+                            used_numeric[name].add(int(number))
+                    except (InvalidOperation, TypeError, ValueError):
+                        pass
+
+        def next_integer(name: str) -> int:
+            limits = cls._integral_field_limits(source_fields[name])
+            if limits is None:
+                raise ValueError(
+                    f"Comparison key {name} must be an integer or a "
+                    "zero-scale numeric field with declared precision."
+                )
+            minimum, maximum = limits
+            used = used_numeric[name]
+            # Prefer compact positive identifiers instead of max + 1. This
+            # remains valid when a semantic boundary row already uses INT_MAX.
+            candidate = 1
+            while candidate <= maximum and candidate in used:
+                candidate += 1
+            if candidate > maximum:
+                candidate = minimum
+                while candidate <= maximum and candidate in used:
+                    candidate += 1
+            if candidate > maximum:
+                raise ValueError(f"No unique {source_fields[name].data_type} value is available for {name}.")
+            used.add(candidate)
+            return candidate
 
         source_index = 0
         while len(expanded) < target_row_count:
-            template = dict(base_rows[source_index % len(base_rows)])
+            row = dict(base_rows[source_index % len(base_rows)])
             source_index += 1
-            candidate = dict(template)
             attempt = 0
             while True:
                 attempt += 1
                 for position, name in enumerate(comparison_keys):
-                    original = template.get(name)
-                    if isinstance(original, int) and not isinstance(original, bool):
-                        value = numeric_next.get(name, len(expanded) + 1)
-                        candidate[name] = value
-                        numeric_next[name] = value + 1
+                    original = row.get(name)
+                    field = source_fields[name]
+                    data_type = str(field.data_type).lower()
+                    if (
+                        isinstance(original, int)
+                        and not isinstance(original, bool)
+                    ) or any(token in data_type for token in ("int", "decimal", "numeric", "number")):
+                        generated_value = next_integer(name)
+                        if any(
+                            token in data_type
+                            for token in ("decimal", "numeric", "number")
+                        ):
+                            row[name] = str(generated_value)
+                        else:
+                            row[name] = generated_value
                     else:
-                        prefix = "KEY" if original is None else str(original)
-                        candidate[name] = (
-                            f"{prefix}_{len(expanded):08d}_{position}_{attempt}"
-                        )
-                candidate_key = tuple(str(candidate[name]) for name in comparison_keys)
-                if candidate_key not in used_keys:
+                        precision = int(field.precision or 64)
+                        suffix = f"_{len(expanded):08d}_{position}_{attempt}"
+                        prefix = "KEY" if original is None or str(original) == "" else str(original)
+                        available = max(1, precision - len(suffix))
+                        row[name] = f"{prefix[:available]}{suffix}"[:precision]
+                key = key_for(row)
+                if "" not in key and key not in used_keys:
                     break
-            used_keys.add(candidate_key)
-            expanded.append(candidate)
+            used_keys.add(key)
+            expanded.append(row)
+
         return expanded
+
+    @staticmethod
+    def _normalize_reference_target_renames(mapping: CanonicalMapping, plan: ReferencePlan) -> ReferencePlan:
+        """Apply connector-grounded terminal renames once, before projection."""
+        targets = {item.name for item in mapping.targets}
+        required = []
+        for connector in mapping.connectors:
+            pair = (connector.from_field, connector.to_field)
+            if connector.to_instance in targets and all(pair) and pair[0] != pair[1] and pair not in required:
+                required.append(pair)
+        operations = list(plan.operations)
+        # Drop equivalent post-target renames. They are reordered below.
+        operations = [op for op in operations if not (op.operation == "RENAME" and (op.rename_from, op.rename_to) in required and op.input_name == plan.output_name)]
+        index = next((i for i, op in enumerate(operations) if op.operation == "PROJECT" and op.output_name == plan.output_name), None)
+        if index is None:
+            plan.operations = operations
+            return plan
+        project = operations[index]
+        columns = list(project.columns)
+        current = project.input_name
+        existing = {(op.rename_from, op.rename_to) for op in operations[:index] if op.operation == "RENAME"}
+        inserted = []
+        for number, (source, target) in enumerate(required, 1):
+            columns = [target if col == source else col for col in columns]
+            if (source, target) in existing or source not in project.columns:
+                continue
+            output = f"{plan.output_name}__AUTO_RENAME_{number}"
+            inserted.append(ReferenceOperation(operation_id=f"AUTO-RENAME-{number:03d}", operation="RENAME", input_name=current, output_name=output, rename_from=source, rename_to=target))
+            current = output
+        if inserted:
+            project.input_name = current
+            operations[index:index] = inserted
+        project.columns = columns
+        plan.operations = operations
+        return plan
+
+    @staticmethod
+    def _logical_validation_rows(
+        input_datasets: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Merge corresponding named-source rows only for schema validation.
+
+        The reference and target executors continue receiving independent named
+        datasets. This logical envelope exists solely because the legacy
+        SyntheticDataValidator validates the union of canonical source fields.
+        Conflicting duplicate field values are rejected rather than overwritten.
+        """
+        if not input_datasets:
+            return []
+        row_count = min(len(rows) for rows in input_datasets.values())
+        merged_rows: list[dict[str, Any]] = []
+        for index in range(row_count):
+            merged: dict[str, Any] = {}
+            conflict = False
+            for rows in input_datasets.values():
+                for name, value in rows[index].items():
+                    if (
+                        name in merged
+                        and merged[name] is not None
+                        and value is not None
+                        and str(merged[name]) != str(value)
+                    ):
+                        conflict = True
+                        break
+                    if name not in merged or merged[name] is None:
+                        merged[name] = value
+                if conflict:
+                    break
+            if not conflict:
+                merged_rows.append(merged)
+        return merged_rows
 
     async def run(self, context: ValidationContext | dict[str, Any]) -> ValidationResult:
         if isinstance(context, dict):
@@ -1686,32 +2552,73 @@ class ValidationAgent:
             for scenario in synthetic.scenarios
             for row in scenario.input_rows
         ]
+        prepared_input_datasets: dict[str, list[dict[str, Any]]] = {}
         if context.input_mode == "SIMULATE":
-            input_rows = self._expand_simulated_rows(
-                base_rows=semantic_rows,
-                comparison_keys=synthetic.comparison_keys,
-                target_row_count=context.requested_row_count,
-            )
+            for dataset in mapping.sources:
+                dataset_base_rows = self._prepare_one_dataset_rows(
+                    semantic_rows,
+                    dataset,
+                )
+                if not dataset_base_rows:
+                    raise ValueError(
+                        "No canonical-schema-valid LLM-generated semantic rows "
+                        f"are available for source dataset {dataset.name}."
+                    )
+                dataset_keys = self._dataset_expansion_keys(
+                    dataset,
+                    synthetic.comparison_keys,
+                )
+                if not dataset_keys:
+                    raise ValueError(
+                        f"Source dataset {dataset.name} has no safe expansion key."
+                    )
+                # Use a lightweight canonical view so the existing generic
+                # expansion logic validates only this dataset's schema.
+                dataset_mapping = mapping.model_copy(
+                    update={"sources": [dataset]}
+                )
+                prepared_input_datasets[dataset.name] = self._expand_simulated_rows(
+                    base_rows=dataset_base_rows,
+                    comparison_keys=dataset_keys,
+                    target_row_count=context.requested_row_count,
+                    mapping=dataset_mapping,
+                )
+            primary_name = mapping.sources[0].name
+            input_rows = prepared_input_datasets[primary_name]
         elif context.input_datasets:
+            prepared_input_datasets = {
+                name: [dict(row) for row in rows]
+                for name, rows in context.input_datasets.items()
+            }
             primary_name = mapping.sources[0].name
             input_rows = list(
-                context.input_datasets.get(primary_name)
-                or next(iter(context.input_datasets.values()))
+                prepared_input_datasets.get(primary_name)
+                or next(iter(prepared_input_datasets.values()))
             )
         else:
             input_rows = semantic_rows
 
         validator = SyntheticDataValidator()
+        validation_rows = (
+            self._logical_validation_rows(prepared_input_datasets)
+            if prepared_input_datasets
+            else input_rows
+        )
         synthetic_validation = validator.run(
             mapping,
             synthetic,
             context.discovery,
-            physical_rows=input_rows,
+            physical_rows=validation_rows,
         )
         stages.append(self._stage(validator, "COMPLETED", synthetic_validation.model_dump(mode="json")))
         tests.extend(self._synthetic_tests(synthetic, synthetic_validation))
         store = ValidationDataStore()
-        input_path = store.write(context.workflow_id, mapping.mapping_name, "synthetic_input.json", input_rows)
+        input_path = store.write(
+            context.workflow_id,
+            mapping.mapping_name,
+            "synthetic_input.json",
+            prepared_input_datasets or input_rows,
+        )
         files["synthetic_input"] = str(input_path)
 
         # Generate an independent reference plan from canonical evidence only.
@@ -1721,6 +2628,10 @@ class ValidationAgent:
             mapping,
             context.discovery,
             context.lineage,
+        )
+        reference_plan = self._normalize_reference_target_renames(
+            mapping,
+            reference_plan,
         )
         stages.append(
             self._stage(
@@ -1749,7 +2660,16 @@ class ValidationAgent:
         tests.extend(self._static_tests(static))
 
         unit_agent = UnitTestExecutionAgent()
-        unit = unit_agent.run(artifacts["UNIT_TEST"], settings.validation_test_timeout_seconds) if static.safe_to_execute_tests else unit_agent.skipped("Static validation blocked pytest execution.")
+        if static.safe_to_execute_tests:
+            with sanitized_spark_environment():
+                unit = unit_agent.run(
+                    artifacts["UNIT_TEST"],
+                    settings.validation_test_timeout_seconds,
+                )
+        else:
+            unit = unit_agent.skipped(
+                "Static validation blocked pytest execution."
+            )
         stages.append(self._stage(unit_agent, "COMPLETED", unit.model_dump(mode="json")))
         tests.extend(self._unit_tests(unit))
 
@@ -1767,7 +2687,10 @@ class ValidationAgent:
             if reference_plan.primary_input
             else mapping.sources[0].name
         )
-        input_datasets = context.input_datasets or {primary_source_name: input_rows}
+        input_datasets = prepared_input_datasets or {
+            name: [dict(row) for row in rows]
+            for name, rows in context.input_datasets.items()
+        }
         reference = reference_executor.run(
             mapping,
             reference_plan,
@@ -1793,7 +2716,7 @@ class ValidationAgent:
             files["reference_output"] = str(reference_path)
 
         target_agent = TargetPySparkExecutor()
-        target = target_agent.run(artifacts["PYSPARK_CODE"], mapping, input_rows, settings.validation_test_timeout_seconds) if synthetic_validation.status == "PASSED" and static.safe_to_execute_tests else TargetExecutionResult(status="SKIPPED", error_message="Synthetic or static validation blocked target execution.")
+        target = target_agent.run(artifacts["PYSPARK_CODE"], mapping, input_datasets, settings.validation_test_timeout_seconds) if synthetic_validation.status == "PASSED" and static.safe_to_execute_tests else TargetExecutionResult(status="SKIPPED", error_message="Synthetic or static validation blocked target execution.")
         stages.append(self._stage(target_agent, "COMPLETED" if target.status == "PASSED" else target.status, target.model_dump(mode="json"), target.error_message))
         target_path = None
         if target.status == "PASSED":

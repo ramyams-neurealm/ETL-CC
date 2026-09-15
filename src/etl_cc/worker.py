@@ -15,16 +15,20 @@ from etl_cc.agents.lineage_agent import LineageAgent
 from etl_cc.config import settings
 from etl_cc.connectors import GitHubSource, MappingSource, PowerCenterSource
 from etl_cc.database import SessionFactory
+from etl_cc.logging_config import configure_logging, log_event, log_exception
 from etl_cc.dependency_planner import DependencyPlanner
 from etl_cc.informatica_parser import InformaticaXMLParser
 from etl_cc.models import AgentResponseETL, CanonicalMapping, ETLObjectETL, RepositoryETL, WorkflowEventETL, WorkflowRunETL
 from etl_cc.security import credential_cipher
-from etl_cc.source_store import load_manifest
+from etl_cc.source_store import consume_source_content, load_content, load_manifest
 
 
 def _hash(value: dict[str, Any]) -> str:
     text = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+logger = configure_logging("DISCOVERY_WORKER")
 
 
 async def _event(session: AsyncSession, workflow_id: int, event_type: str, status: str, message: str, progress: int, payload: dict | None = None, stage: str = "DISCOVERY", agent_response_id: int | None = None) -> None:
@@ -46,10 +50,10 @@ async def _claim() -> int | None:
             return row.id
 
 
-async def _source(repository: RepositoryETL, workflow: WorkflowRunETL) -> MappingSource | None:
-    manifest = load_manifest(workflow.scope_payload["source_id"])
+async def _source(session: AsyncSession, repository: RepositoryETL, workflow: WorkflowRunETL) -> MappingSource | None:
+    manifest = await load_manifest(session, workflow.scope_payload["source_id"])
     credential = credential_cipher.decrypt(repository.credential_ciphertext) if repository.credential_ciphertext else None
-    directory = settings.project_root / "runtime_sources" / repository.connection_type.lower() / manifest["source_id"]
+    directory = Path(settings.memory_workspace_root) / repository.connection_type.lower() / manifest["source_id"]
     if repository.connection_type == "POWERCENTER":
         return PowerCenterSource(manifest["config"], credential or "")
     if repository.connection_type == "GITHUB":
@@ -59,13 +63,18 @@ async def _source(repository: RepositoryETL, workflow: WorkflowRunETL) -> Mappin
     raise ValueError(f"Unsupported connection type: {repository.connection_type}")
 
 
-async def _load_mappings(repository: RepositoryETL, workflow: WorkflowRunETL) -> list[CanonicalMapping]:
+async def _load_mappings(session: AsyncSession, repository: RepositoryETL, workflow: WorkflowRunETL) -> list[CanonicalMapping]:
     selected = workflow.scope_payload.get("selected_mapping_keys") or None
-    manifest = load_manifest(workflow.scope_payload["source_id"])
+    manifest = await load_manifest(session, workflow.scope_payload["source_id"])
+    if manifest.get("product_code") != "INFORMATICA":
+        raise ValueError(f"Discovery is not implemented for {manifest.get('product_code')}.")
     if repository.connection_type == "XML_UPLOAD":
-        path = Path(manifest["config"]["stored_file_path"])
-        return InformaticaXMLParser().parse_selected(path, set(selected) if selected else None, "INFORMATICA_XML_UPLOAD", path.name)
-    source = await _source(repository, workflow)
+        content = await load_content(session, workflow.scope_payload["source_id"])
+        return InformaticaXMLParser().parse_selected_bytes(
+            content, set(selected) if selected else None,
+            "INFORMATICA_XML_UPLOAD", manifest["config"]["original_file_name"],
+        )
+    source = await _source(session, repository, workflow)
     if source is None:
         raise ValueError("Source adapter was not created.")
     return await source.get_mapping_details(selected)
@@ -102,20 +111,70 @@ async def _run_mapping_agent(session: AsyncSession, workflow: WorkflowRunETL, re
     await session.flush()
     await _event(session, workflow.id, f"{agent.AGENT_NAME}_STARTED", "RUNNING", f"{agent.AGENT_NAME} started for {mapping.mapping_name}.", progress, {"etl_object_id": row.id, "mapping_name": mapping.mapping_name}, agent.STAGE_NAME, audit.id)
     await session.commit()
+    log_event(
+        logger,
+        "AGENT_INPUT",
+        workflow_id=workflow.workflow_id,
+        repository_id=repository.id,
+        etl_object_id=row.id,
+        mapping_name=mapping.mapping_name,
+        agent_name=agent.AGENT_NAME,
+        stage_name=agent.STAGE_NAME,
+        attempt_number=attempt,
+        request_payload=audit.request_payload,
+    )
     try:
         result = await agent.run(mapping)
         audit.status = "COMPLETED"
         audit.response_payload = result.model_dump(mode="json")
+        audit.input_tokens = int(getattr(agent, "input_tokens", 0) or 0)
+        audit.output_tokens = int(getattr(agent, "output_tokens", 0) or 0)
+        audit.model_name = str(
+            getattr(agent, "model_name", None)
+            or getattr(agent, "MODEL_NAME", "DETERMINISTIC")
+        )
         audit.completed_at = datetime.now(timezone.utc)
         await _event(session, workflow.id, f"{agent.AGENT_NAME}_COMPLETED", "COMPLETED", f"{agent.AGENT_NAME} completed for {mapping.mapping_name}.", progress, {"etl_object_id": row.id, "mapping_name": mapping.mapping_name, "agent_response_id": audit.id}, agent.STAGE_NAME, audit.id)
         await session.commit()
+        log_event(
+            logger,
+            "AGENT_OUTPUT",
+            workflow_id=workflow.workflow_id,
+            repository_id=repository.id,
+            etl_object_id=row.id,
+            mapping_name=mapping.mapping_name,
+            agent_name=agent.AGENT_NAME,
+            stage_name=agent.STAGE_NAME,
+            attempt_number=attempt,
+            input_tokens=audit.input_tokens,
+            output_tokens=audit.output_tokens,
+            response_payload=audit.response_payload,
+        )
         return result
     except Exception as exc:
         audit.status = "FAILED"
+        audit.input_tokens = int(getattr(agent, "input_tokens", 0) or 0)
+        audit.output_tokens = int(getattr(agent, "output_tokens", 0) or 0)
+        audit.model_name = str(
+            getattr(agent, "model_name", None)
+            or getattr(agent, "MODEL_NAME", "DETERMINISTIC")
+        )
         audit.error_message = str(exc)[:4000]
         audit.completed_at = datetime.now(timezone.utc)
         await _event(session, workflow.id, f"{agent.AGENT_NAME}_FAILED", "FAILED", f"{agent.AGENT_NAME} failed for {mapping.mapping_name}.", progress, {"etl_object_id": row.id}, agent.STAGE_NAME, audit.id)
         await session.commit()
+        log_exception(
+            logger,
+            "AGENT_FAILED",
+            exc,
+            workflow_id=workflow.workflow_id,
+            repository_id=repository.id,
+            etl_object_id=row.id,
+            mapping_name=mapping.mapping_name,
+            agent_name=agent.AGENT_NAME,
+            stage_name=agent.STAGE_NAME,
+            attempt_number=attempt,
+        )
         raise
 
 
@@ -159,7 +218,9 @@ async def _process(workflow_id: int) -> None:
             raise ValueError("Workflow or repository was not found.")
         await _event(session, workflow.id, "DISCOVERY_STARTED", "RUNNING", "Mapping discovery started.", 5, {"connection_type": repository.connection_type})
         await session.commit()
-        mappings = await _load_mappings(repository, workflow)
+        log_event(logger, "SOURCE_LOAD_STARTED", workflow_id=workflow.workflow_id, repository_id=repository.id, connection_type=repository.connection_type)
+        mappings = await _load_mappings(session, repository, workflow)
+        log_event(logger, "CANONICAL_MAPPINGS_LOADED", workflow_id=workflow.workflow_id, repository_id=repository.id, mapping_count=len(mappings), mappings=[item.model_dump(mode="json") for item in mappings])
         if not mappings:
             raise ValueError("No mappings matched the discovery scope.")
         rows: dict[str, ETLObjectETL] = {}
@@ -191,6 +252,8 @@ async def _process(workflow_id: int) -> None:
         workflow.failure_stage = None
         workflow.failure_reason = None
         workflow.completed_at = datetime.now(timezone.utc)
+        if repository.connection_type == "XML_UPLOAD":
+            await consume_source_content(session, workflow.scope_payload["source_id"])
         await _event(session, workflow.id, "DEPENDENCY_PLANNING_WORKFLOW_COMPLETED", "COMPLETED", "Discovery, lineage, and dependency planning completed.", 100, {"mapping_count": total}, "DEPENDENCY_PLANNING")
         await session.commit()
 

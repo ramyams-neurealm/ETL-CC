@@ -177,13 +177,40 @@ class GitDeploymentAgent:
         except subprocess.CalledProcessError as exc: raise RuntimeError((exc.stderr or exc.stdout or str(exc))[-4000:]) from exc
 
     @staticmethod
-    def _git_environment(token, temp):
-        env=os.environ.copy(); env.update({"GIT_TERMINAL_PROMPT":"0","GIT_CONFIG_NOSYSTEM":"1"})
-        if not token: return env,None
-        script=temp/"git-askpass.py"; script.write_text("import os,sys\np=sys.argv[1].lower() if len(sys.argv)>1 else ''\nprint(os.environ['NEUFLOW_GIT_USERNAME'] if 'username' in p else os.environ['NEUFLOW_GIT_TOKEN'])\n",encoding="utf-8")
-        script.chmod(script.stat().st_mode|stat.S_IXUSR)
-        env.update({"GIT_ASKPASS":str(script),"NEUFLOW_GIT_USERNAME":"x-access-token","NEUFLOW_GIT_TOKEN":token})
-        return env,script
+    def _git_environment(token: str | None, temp: Path):
+        """Build a non-interactive Git environment without embedding secrets."""
+        env = os.environ.copy()
+        env.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+            }
+        )
+        if not token:
+            return env, None
+
+        # Git executes GIT_ASKPASS directly. An explicit POSIX shell shebang
+        # prevents the helper from being interpreted with the wrong runtime.
+        # The PAT is supplied only through the child-process environment.
+        script = temp / "git-askpass.sh"
+        script.write_text(
+            "#!/bin/sh\n"
+            "case \"${1:-}\" in\n"
+            "  *[Uu]sername*) printf '%s\\n' \"$NEUFLOW_GIT_USERNAME\" ;;\n"
+            "  *) printf '%s\\n' \"$NEUFLOW_GIT_TOKEN\" ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        script.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+        env.update(
+            {
+                "GIT_ASKPASS": str(script),
+                "GIT_ASKPASS_REQUIRE": "force",
+                "NEUFLOW_GIT_USERNAME": "x-access-token",
+                "NEUFLOW_GIT_TOKEN": token,
+            }
+        )
+        return env, script
 
     def _create_pull_request(self, context, commit_sha):
         parsed=urlparse(context.remote_url)

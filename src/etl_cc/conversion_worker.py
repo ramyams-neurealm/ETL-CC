@@ -1,7 +1,9 @@
 """Wave-aware worker for RAG, GPT-4o conversion, critique, retries, and artifacts."""
 
 import asyncio
+import hashlib
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,11 +15,12 @@ from etl_cc.agents.conversion_agent import (
 )
 from etl_cc.agents.critique_agent import CritiqueAgent
 from etl_cc.agents.rag_retrieval_agent import RAGRetrievalAgent
-from etl_cc.artifact_store import artifact_store
 from etl_cc.config import settings
 from etl_cc.database import SessionFactory
+from etl_cc.logging_config import configure_logging, log_event, log_exception
 from etl_cc.models import (
     AgentResponseETL,
+    ArtifactContentETL,
     CanonicalMapping,
     ETLObjectETL,
     GeneratedArtifactETL,
@@ -25,6 +28,9 @@ from etl_cc.models import (
     WorkflowEventETL,
     WorkflowRunETL,
 )
+
+
+logger = configure_logging("CONVERSION_WORKER")
 
 
 async def _event(
@@ -138,6 +144,18 @@ async def _audit_start(
     session.add(audit)
     await session.flush()
     await session.commit()
+    log_event(
+        logger,
+        "AGENT_INPUT",
+        workflow_id=workflow.workflow_id,
+        repository_id=workflow.repository_id,
+        etl_object_id=mapping_row.id,
+        mapping_name=mapping_row.object_name,
+        agent_name=agent.AGENT_NAME,
+        stage_name=agent.STAGE_NAME,
+        attempt_number=attempt,
+        request_payload=request_payload,
+    )
     return audit
 
 
@@ -160,6 +178,19 @@ async def _audit_complete(
     audit.output_tokens = int(getattr(agent, "output_tokens", 0) or 0)
     audit.completed_at = datetime.now(timezone.utc)
     await session.commit()
+    log_event(
+        logger,
+        "AGENT_OUTPUT",
+        workflow_run_id=audit.workflow_run_id,
+        etl_object_id=audit.etl_object_id,
+        agent_name=audit.agent_name,
+        stage_name=audit.stage_name,
+        attempt_number=audit.attempt_number,
+        model_name=audit.model_name,
+        input_tokens=audit.input_tokens,
+        output_tokens=audit.output_tokens,
+        response_payload=audit.response_payload,
+    )
 
 
 async def _audit_fail(
@@ -229,26 +260,21 @@ async def _save_artifacts(
     critique_passed: bool,
 ) -> None:
     for generated in result.generated_files:
-        path, digest = artifact_store.save_text(
-            workflow_id=workflow.workflow_id,
-            mapping_name=mapping_row.object_name,
-            file_name=generated.file_name,
-            content=generated.content,
-        )
+        content_bytes = generated.content.encode("utf-8")
+        digest = hashlib.sha256(content_bytes).hexdigest()
         artifact_version = await _next_artifact_version(
             session,
             mapping_row.id,
             generated.artifact_type,
         )
-        session.add(
-            GeneratedArtifactETL(
+        artifact = GeneratedArtifactETL(
                 workflow_run_id=workflow.id,
                 etl_object_id=mapping_row.id,
                 artifact_type=generated.artifact_type,
                 artifact_version=artifact_version,
                 file_name=generated.file_name,
-                storage_provider="LOCAL",
-                storage_path=str(path),
+                storage_provider="POSTGRESQL",
+                storage_path="pending",
                 content_hash=digest,
                 media_type=generated.media_type,
                 validation_status=(
@@ -258,7 +284,29 @@ async def _save_artifacts(
                 ),
                 is_deployable=False,
             )
+        session.add(artifact)
+        await session.flush()
+        artifact.storage_path = f"postgresql://artifact/{artifact.id}"
+        log_event(
+            logger,
+            "ARTIFACT_STORED_IN_POSTGRESQL",
+            workflow_id=workflow.workflow_id,
+            repository_id=workflow.repository_id,
+            etl_object_id=mapping_row.id,
+            mapping_name=mapping_row.object_name,
+            artifact_id=artifact.id,
+            artifact_type=generated.artifact_type,
+            file_name=generated.file_name,
+            content_hash=digest,
+            content_size_bytes=len(content_bytes),
+            line_count=len(generated.content.splitlines()),
         )
+        session.add(ArtifactContentETL(
+            artifact_id=artifact.id,
+            content_text=generated.content,
+            encoding="UTF-8",
+            content_size_bytes=len(content_bytes),
+        ))
     await session.commit()
 
 
@@ -438,6 +486,7 @@ async def _process_mapping(
                 "attempt": attempt_index,
                 "maximum_attempts": settings.conversion_max_attempts,
                 "issue_count": len(feedback),
+                "issues": feedback,
             },
             critique_audit.id,
         )
@@ -476,6 +525,73 @@ async def _process_mapping(
             f"Critique did not approve mapping {mapping_row.object_name} "
             f"after {settings.conversion_max_attempts} attempts."
         )
+
+
+async def _queue_automatic_validation(
+    session: AsyncSession,
+    conversion: WorkflowRunETL,
+) -> WorkflowRunETL | None:
+    """Queue SIMULATE validation for a parent MIG migration."""
+    if not conversion.batch_id:
+        return None
+    parent = await session.scalar(select(WorkflowRunETL).where(
+        WorkflowRunETL.workflow_id == conversion.batch_id,
+        WorkflowRunETL.job_type == "MIGRATION",
+    ))
+    if parent is None:
+        return None
+    options = parent.scope_payload.get("validation_options") or {}
+    validation = WorkflowRunETL(
+        workflow_id=f"VAL-{uuid4()}",
+        batch_id=parent.workflow_id,
+        repository_id=conversion.repository_id,
+        current_stage="VALIDATION",
+        overall_status="QUEUED",
+        job_type="VALIDATION",
+        job_status="QUEUED",
+        scope_payload={
+            "etl_object_ids": conversion.scope_payload.get("etl_object_ids", []),
+            "conversion_workflow_id": conversion.workflow_id,
+            "validation_mode": "STATIC_AND_UNIT_TEST",
+            "minimum_functional_parity": float(options.get("minimum_functional_parity", 0.95)),
+            "input_mode": "SIMULATE",
+            "simulation_options": {
+                "target_row_count": int(options.get("target_row_count", 1000)),
+                "include_null_cases": True,
+                "include_boundary_cases": True,
+                "include_negative_cases": True,
+                "include_duplicate_cases": False,
+            },
+            "dataset_files": [],
+            "database_tables": None,
+        },
+        max_attempts=1,
+    )
+    session.add(validation)
+    await session.flush()
+    session.add(WorkflowEventETL(
+        workflow_run_id=validation.id,
+        event_type="VALIDATION_QUEUED",
+        stage_name="VALIDATION",
+        status="QUEUED",
+        progress_percentage=0,
+        message="Validation was queued automatically after Conversion and Critique.",
+        event_payload={"conversion_workflow_id": conversion.workflow_id},
+        actor_type="SYSTEM",
+    ))
+    parent.current_stage = "VALIDATION"
+    parent.scope_payload = {**parent.scope_payload, "validation_workflow_id": validation.workflow_id}
+    session.add(WorkflowEventETL(
+        workflow_run_id=parent.id,
+        event_type="AUTOMATIC_VALIDATION_QUEUED",
+        stage_name="MIGRATION",
+        status="RUNNING",
+        progress_percentage=60,
+        message="Conversion and critique completed. Validation was queued.",
+        event_payload={"conversion_workflow_id": conversion.workflow_id, "validation_workflow_id": validation.workflow_id},
+        actor_type="SYSTEM",
+    ))
+    return validation
 
 
 async def _process(workflow_id: int) -> None:
@@ -566,6 +682,7 @@ async def _process(workflow_id: int) -> None:
             100,
             {"mapping_count": total},
         )
+        await _queue_automatic_validation(session, workflow)
         await session.commit()
 
 
@@ -580,6 +697,20 @@ async def _fail(workflow_id: int, exc: Exception) -> None:
         workflow.failure_stage = "CONVERSION"
         workflow.failure_reason = str(exc)[:4000]
         workflow.completed_at = datetime.now(timezone.utc)
+        if workflow.batch_id:
+            parent = await session.scalar(
+                select(WorkflowRunETL).where(
+                    WorkflowRunETL.workflow_id == workflow.batch_id
+                )
+            )
+            if parent is not None:
+                parent.job_status = "FAILED"
+                parent.overall_status = "FAILED"
+                parent.current_stage = "CONVERSION_FAILED"
+                parent.failure_stage = "CONVERSION"
+                parent.failure_reason = str(exc)[:4000]
+                parent.completed_at = datetime.now(timezone.utc)
+
         await _event(
             session,
             workflow,

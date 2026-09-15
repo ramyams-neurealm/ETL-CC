@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from sqlalchemy import func, select
@@ -20,8 +21,10 @@ from etl_cc.connectors import load_postgresql_table
 from etl_cc.security import validation_credential_cipher
 from etl_cc.models import ValidationDatabaseConnectionETL
 from etl_cc.database import SessionFactory
+from etl_cc.logging_config import configure_logging, log_event, log_exception
 from etl_cc.models import (
     AgentResponseETL,
+    ArtifactContentETL,
     CanonicalMapping,
     ETLObjectETL,
     GeneratedArtifactETL,
@@ -32,6 +35,9 @@ from etl_cc.validation_test_case_service import (
     replace_planned_test_cases,
     upsert_test_case,
 )
+
+
+logger = configure_logging("VALIDATION_WORKER")
 
 
 async def _claim() -> int | None:
@@ -152,6 +158,21 @@ async def _audit_stage(
     )
     session.add(audit)
     await session.flush()
+    log_event(
+        logger,
+        "VALIDATION_STAGE_OUTPUT",
+        workflow_id=workflow.workflow_id,
+        repository_id=workflow.repository_id,
+        etl_object_id=mapping.id,
+        mapping_name=mapping.object_name,
+        agent_name=stage.agent_name,
+        stage_name=stage.stage_name,
+        status=stage.status,
+        input_tokens=stage.input_tokens,
+        output_tokens=stage.output_tokens,
+        response_payload=stage.response_payload,
+        error_message=stage.error_message,
+    )
     return audit
 
 
@@ -283,10 +304,27 @@ async def _persist_result(
             stage,
         )
 
+    summary_stage = ValidationStageResult(
+        agent_name="VALIDATION_AGENT",
+                agent_version=ValidationAgent.AGENT_VERSION,
+        stage_name="ZERO_TOUCH_VALIDATION",
+        model_name="HYBRID_GPT4O_DETERMINISTIC",
+        prompt_name=None,
+        prompt_version=None,
+        input_tokens=0,
+        output_tokens=0,
+        status="COMPLETED" if result.status == "PASSED" else "FAILED",
+        response_payload=result.model_dump(mode="json"),
+        error_message=result.failure_reason,
+    )
+    audit_by_agent[summary_stage.agent_name] = await _audit_stage(
+        session, workflow, mapping, summary_stage
+    )
+
     category_agent = {
         "STATIC_VALIDATION": "STATIC_VALIDATION_AGENT",
         "UNIT_TEST": "UNIT_TEST_EXECUTION_AGENT",
-        "SYNTHETIC_DATA": "SYNTHETIC_TEST_DATA_AGENT",
+        "SYNTHETIC_DATA": "SYNTHETIC_DATA_VALIDATOR",
         "FUNCTIONAL_PARITY": "FUNCTIONAL_PARITY_AGENT",
         "DATA_PARITY": "MATCHFLOW_COMPARATOR",
     }
@@ -378,10 +416,30 @@ async def _process(workflow_id: int) -> None:
                 workflow.repository_id,
                 mapping.id,
             )
-            artifact_paths = {
-                artifact_type: Path(row.storage_path)
-                for artifact_type, row in artifact_rows.items()
-            }
+            temporary_directory = TemporaryDirectory(
+                prefix=f"etlcc-{workflow.workflow_id}-{mapping.id}-",
+                dir="/dev/shm" if Path("/dev/shm").is_dir() else None,
+            )
+            artifact_paths = {}
+            for artifact_type, row in artifact_rows.items():
+                content_row = await session.get(ArtifactContentETL, row.id)
+                if content_row is None:
+                    raise RuntimeError(
+                            f"Artifact content is missing for artifact {row.id}."
+                        )
+                if content_row.content_text is not None:
+                    content = content_row.content_text
+                elif content_row.content_json is not None:
+                    import json
+                    content = json.dumps(content_row.content_json, indent=2, sort_keys=True)
+                elif content_row.content_binary is not None:
+                    content = bytes(content_row.content_binary).decode(content_row.encoding or "UTF-8")
+                else:
+                    raise RuntimeError(f"Artifact {row.id} has no content value.")
+                path = Path(temporary_directory.name) / Path(row.file_name).name
+                path.write_text(content, encoding="utf-8")
+                artifact_paths[artifact_type] = path
+
             canonical = CanonicalMapping.model_validate(
                 mapping.source_definition
             )
@@ -408,25 +466,51 @@ async def _process(workflow_id: int) -> None:
                     password = validation_credential_cipher().decrypt(connection_row.credential_ciphertext)
                     expected_output_rows = await load_postgresql_table(connection_row.connection_config,password,target_spec["schema_name"],target_spec["table_name"],int(specification.get("row_limit",settings.validation_database_row_limit)))
 
-            result = await ValidationAgent().run(
-                ValidationContext(
-                    workflow_id=workflow.workflow_id,
-                    mapping=canonical,
-                    discovery=discovery,
-                    lineage=mapping.lineage or {},
-                    artifact_paths=artifact_paths,
-                    minimum_functional_parity=minimum,
-                    input_mode=input_mode,
-                    input_datasets=input_datasets,
-                    expected_output_rows=expected_output_rows,
-                    requested_row_count=requested_row_count,
-                )
+            log_event(
+                logger,
+                "VALIDATION_INPUT",
+                workflow_id=workflow.workflow_id,
+                repository_id=workflow.repository_id,
+                etl_object_id=mapping.id,
+                mapping_name=mapping.object_name,
+                input_mode=input_mode,
+                requested_row_count=requested_row_count,
+                canonical_mapping=canonical.model_dump(mode="json"),
+                discovery=discovery,
+                lineage=mapping.lineage or {},
+                artifact_types=sorted(artifact_paths),
             )
+            try:
+                result = await ValidationAgent().run(
+                    ValidationContext(
+                        workflow_id=workflow.workflow_id,
+                        mapping=canonical,
+                        discovery=discovery,
+                        lineage=mapping.lineage or {},
+                        artifact_paths=artifact_paths,
+                        minimum_functional_parity=minimum,
+                        input_mode=input_mode,
+                        input_datasets=input_datasets,
+                        expected_output_rows=expected_output_rows,
+                        requested_row_count=requested_row_count,
+                    )
+                )
+            finally:
+                temporary_directory.cleanup()
             await _persist_result(
                 session,
                 workflow,
                 mapping,
                 result,
+            )
+            log_event(
+                logger,
+                "VALIDATION_OUTPUT",
+                workflow_id=workflow.workflow_id,
+                repository_id=workflow.repository_id,
+                etl_object_id=mapping.id,
+                mapping_name=mapping.object_name,
+                validation_result=result.model_dump(mode="json"),
             )
 
             passed = result.status == "PASSED" and result.deployable
@@ -487,11 +571,70 @@ async def _process(workflow_id: int) -> None:
             workflow.overall_status,
             "Validation workflow completed.",
             100,
-            {
-                "all_passed": all_passed,
-                "mapping_count": len(mappings),
-            },
+            {"all_passed": all_passed, "mapping_count": len(mappings)},
         )
+        if workflow.batch_id:
+            parent = await session.scalar(select(WorkflowRunETL).where(
+                WorkflowRunETL.workflow_id == workflow.batch_id,
+                WorkflowRunETL.job_type == "MIGRATION",
+            ))
+            if parent is not None:
+                auto_deploy = bool(
+                    all_passed
+                    and settings.auto_deploy_after_validation
+                    and settings.git_deployment_repository_url
+                    and settings.git_deployment_access_token
+                )
+                if auto_deploy:
+                    parent.current_stage = "DEPLOYMENT_QUEUED"
+                    parent.overall_status = "RUNNING"
+                    parent.job_status = "QUEUED"
+                    parent.failure_stage = None
+                    parent.failure_reason = None
+                    parent.completed_at = None
+                    for mapping in mappings:
+                        if mapping.migration_status == "VALIDATED":
+                            mapping.migration_status = "DEPLOYMENT_QUEUED"
+                    event_type = "MIGRATION_DEPLOYMENT_QUEUED"
+                    status_value = "QUEUED"
+                    progress = 90
+                    message = "Validation passed. Automatic Git deployment queued."
+                elif all_passed:
+                    parent.current_stage = "READY_FOR_DEPLOYMENT"
+                    parent.overall_status = "COMPLETED"
+                    parent.job_status = "COMPLETED"
+                    parent.failure_stage = None
+                    parent.failure_reason = None
+                    parent.completed_at = datetime.now(timezone.utc)
+                    event_type = "MIGRATION_READY_FOR_DEPLOYMENT"
+                    status_value = "COMPLETED"
+                    progress = 100
+                    message = "Migration processing completed. Git deployment configuration is missing."
+                else:
+                    parent.current_stage = "VALIDATION_FAILED"
+                    parent.overall_status = "FAILED"
+                    parent.job_status = "FAILED"
+                    parent.failure_stage = "VALIDATION"
+                    parent.failure_reason = workflow.failure_reason
+                    parent.completed_at = datetime.now(timezone.utc)
+                    event_type = "MIGRATION_VALIDATION_FAILED"
+                    status_value = "FAILED"
+                    progress = 100
+                    message = "Migration failed during Validation."
+                session.add(WorkflowEventETL(
+                    workflow_run_id=parent.id,
+                    event_type=event_type,
+                    stage_name="MIGRATION",
+                    status=status_value,
+                    progress_percentage=progress,
+                    message=message,
+                    event_payload={
+                        "validation_workflow_id": workflow.workflow_id,
+                        "repository_url_configured": bool(settings.git_deployment_repository_url),
+                        "base_branch": settings.git_deployment_base_branch,
+                    },
+                    actor_type="SYSTEM",
+                ))
         await session.commit()
 
 
@@ -519,6 +662,35 @@ async def _fail(workflow_id: int, exc: Exception) -> None:
                 "error": str(exc)[:1000],
             },
         )
+        if workflow.batch_id:
+            parent = await session.scalar(
+                select(WorkflowRunETL).where(
+                    WorkflowRunETL.workflow_id == workflow.batch_id,
+                    WorkflowRunETL.job_type == "MIGRATION",
+                )
+            )
+            if parent is not None:
+                parent.current_stage = "VALIDATION_FAILED"
+                parent.overall_status = "FAILED"
+                parent.job_status = "FAILED"
+                parent.failure_stage = "VALIDATION"
+                parent.failure_reason = workflow.failure_reason
+                parent.completed_at = datetime.now(timezone.utc)
+                session.add(
+                    WorkflowEventETL(
+                        workflow_run_id=parent.id,
+                        event_type="MIGRATION_VALIDATION_FAILED",
+                        stage_name="MIGRATION",
+                        status="FAILED",
+                        progress_percentage=100,
+                        message="Migration failed during Validation.",
+                        event_payload={
+                            "validation_workflow_id": workflow.workflow_id,
+                            "error": workflow.failure_reason,
+                        },
+                        actor_type="SYSTEM",
+                    )
+                )
         await session.commit()
 
 

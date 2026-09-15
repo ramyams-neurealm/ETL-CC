@@ -149,6 +149,64 @@ class PowerCenterSource(MappingSource):
         return results
 
 
+class GitHubDeploymentTargetConnector:
+    """Read-only capability probe for a GitHub deployment destination."""
+
+    def __init__(self, repository_url: str, base_branch: str, token: str | None):
+        self.repository_url = repository_url
+        self.base_branch = base_branch
+        self.token = token
+
+    def _coordinates(self) -> tuple[str, str]:
+        parsed = urlparse(self.repository_url)
+        parts = parsed.path.strip("/").removesuffix(".git").split("/")
+        if parsed.netloc.lower() not in {"github.com", "www.github.com"} or len(parts) != 2:
+            raise ETLConnectionError("repository_url must be a GitHub owner/repository URL.")
+        return parts[0], parts[1]
+
+    def _headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    async def test(self) -> dict[str, bool]:
+        owner, repo = self._coordinates()
+        base = f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}"
+        async with httpx.AsyncClient(
+            timeout=settings.github_api_timeout_seconds,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(base, headers=self._headers())
+            if response.status_code in {401, 403}:
+                raise ETLAuthenticationError("GitHub authentication or repository access failed.")
+            if response.status_code == 404:
+                raise ETLRepositoryNotFoundError("GitHub repository was not found.")
+            response.raise_for_status()
+            repository = response.json()
+            branch = await client.get(
+                f"{base}/branches/{quote(self.base_branch, safe='')}",
+                headers=self._headers(),
+            )
+            if branch.status_code == 404:
+                raise ETLRepositoryNotFoundError("GitHub base branch was not found.")
+            if branch.status_code in {401, 403}:
+                raise ETLAuthenticationError("GitHub base branch access failed.")
+            branch.raise_for_status()
+
+        permissions = repository.get("permissions") or {}
+        can_push = bool(permissions.get("push") or permissions.get("maintain") or permissions.get("admin"))
+        return {
+            "authenticated": bool(self.token),
+            "can_read": True,
+            "can_push": can_push,
+            "can_create_pull_request": can_push,
+        }
+
+
 class GitHubSource(MappingSource):
     """Read Informatica XML exports from a GitHub repository through its API."""
 

@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -24,7 +25,9 @@ from etl_cc.config import settings
 from etl_cc.database import Base
 
 ETL_SCHEMA = settings.pg_schema
-ConnectionType = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+ProductCode = Literal["INFORMATICA", "DATASTAGE", "AB_INITIO"]
+MethodCode = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+ConnectionType = MethodCode
 EnvironmentType = Literal["DEV", "STAGING", "PROD"]
 
 
@@ -39,6 +42,24 @@ class ValidationDatabaseConnectionETL(Base):
     credential_algorithm: Mapped[str] = mapped_column(String(30), nullable=False, default="FERNET")
     credential_key_version: Mapped[str] = mapped_column(String(30), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+class SourceSnapshotETL(Base):
+    """Temporary source content stored in PostgreSQL until canonicalization."""
+
+    __tablename__ = "source_snapshot_etl"
+    __table_args__ = ({"schema": ETL_SCHEMA},)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_id: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    connection_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_content: Mapped[bytes | None] = mapped_column(LargeBinary)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    content_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
 
 class RepositoryETL(Base):
     """Store one configured PowerCenter, GitHub, or XML-upload source."""
@@ -214,7 +235,16 @@ class WorkflowEventETL(Base):
 
 class GeneratedArtifactETL(Base):
     __tablename__ = "generated_artifact_etl"
-    __table_args__ = ({"schema": ETL_SCHEMA},)
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_run_id",
+            "etl_object_id",
+            "artifact_type",
+            "artifact_version",
+            name="uq_generated_artifact_etl_version",
+        ),
+        {"schema": ETL_SCHEMA},
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     workflow_run_id: Mapped[int] = mapped_column(
@@ -237,6 +267,45 @@ class GeneratedArtifactETL(Base):
     validation_status: Mapped[str | None] = mapped_column(String(30))
     is_deployable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ArtifactContentETL(Base):
+    """Generated artifact content stored permanently in PostgreSQL."""
+
+    __tablename__ = "artifact_content_etl"
+    __table_args__ = ({"schema": ETL_SCHEMA},)
+
+    artifact_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            f"{ETL_SCHEMA}.generated_artifact_etl.id",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    content_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_json: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True),
+        nullable=True,
+    )
+    content_binary: Mapped[bytes | None] = mapped_column(
+        LargeBinary,
+        nullable=True,
+    )
+    content_size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    encoding: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="UTF-8",
+        server_default="UTF-8",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
 
 
 class KnowledgeBaseETL(Base):
@@ -305,6 +374,8 @@ class ValidationTestCaseETL(Base):
 
 
 class PowerCenterConnectionRequest(BaseModel):
+    product_code: ProductCode
+    method_code: MethodCode
     connection_name: str = Field(min_length=2, max_length=200)
     environment: EnvironmentType
     host: str = Field(min_length=1, max_length=255)
@@ -317,6 +388,8 @@ class PowerCenterConnectionRequest(BaseModel):
 
 
 class GitHubConnectionRequest(BaseModel):
+    product_code: ProductCode
+    method_code: MethodCode
     connection_name: str = Field(min_length=2, max_length=200)
     environment: EnvironmentType
     repository_url: HttpUrl
@@ -337,6 +410,8 @@ class MappingSummary(BaseModel):
 class SourceAnalysisResponse(BaseModel):
     status: Literal["SUCCESS"]
     message: str
+    product_code: ProductCode
+    method_code: MethodCode
     connection_type: ConnectionType
     source_id: str
     test_token: str
@@ -471,6 +546,7 @@ class ComplexityDistribution(BaseModel):
     LOW: int = 0
     MEDIUM: int = 0
     HIGH: int = 0
+    VERY_HIGH: int = 0
     UNKNOWN: int = 0
 
 
@@ -558,6 +634,33 @@ class AgentResponseSummary(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
+
+
+class MigrationValidationOptions(BaseModel):
+    input_mode: Literal["SIMULATE"] = "SIMULATE"
+    minimum_functional_parity: float = Field(default=0.95, ge=0.0, le=1.0)
+    target_row_count: int = Field(default=1000, ge=1, le=10000)
+
+
+class StartMigrationRequest(BaseModel):
+    repository_id: int
+    etl_object_ids: list[int] = Field(min_length=1)
+    target_platform: Literal["DATABRICKS"] = "DATABRICKS"
+    target_framework: Literal["PYSPARK"] = "PYSPARK"
+    follow_migration_waves: bool = True
+    validation_options: MigrationValidationOptions = Field(
+        default_factory=MigrationValidationOptions
+    )
+
+
+class StartMigrationResponse(BaseModel):
+    migration_id: str
+    conversion_workflow_id: str
+    repository_id: int
+    status: Literal["QUEUED"]
+    current_stage: Literal["CONVERSION"] = "CONVERSION"
+    mapping_count: int
+    message: str
 
 
 class StartConversionRequest(BaseModel):
@@ -718,6 +821,44 @@ class ValidationTestCaseResponse(BaseModel):
     updated_at: datetime
 
 
+class GitHubDeploymentTargetTestRequest(BaseModel):
+    connection_name: str = Field(min_length=2, max_length=200)
+    environment: EnvironmentType
+    repository_url: HttpUrl
+    base_branch: str = Field(default="main", min_length=1, max_length=255)
+    access_token: SecretStr | None = None
+
+
+class GitHubDeploymentTargetTestResponse(BaseModel):
+    status: Literal["SUCCESS"]
+    target_id: str
+    test_token: str
+    expires_in_seconds: int
+    repository_url: str
+    base_branch: str
+    authenticated: bool
+    can_read: bool
+    can_push: bool
+    can_create_pull_request: bool
+
+
+class SaveDeploymentTargetRequest(BaseModel):
+    target_id: str
+    test_token: str
+
+
+class DeploymentTargetResponse(BaseModel):
+    target_repository_id: int
+    connection_name: str
+    provider: Literal["GITHUB"]
+    environment: EnvironmentType
+    repository_url: str
+    base_branch: str
+    connection_status: str
+    capabilities: dict[str, bool] = Field(default_factory=dict)
+    created_at: datetime
+
+
 class StartDeploymentRequest(BaseModel):
     repository_id: int
     etl_object_ids: list[int] = Field(min_length=1)
@@ -731,11 +872,21 @@ class StartDeploymentRequest(BaseModel):
     pull_request_title: str | None = Field(default=None, max_length=300)
     pull_request_body: str | None = Field(default=None, max_length=4000)
 
+class DeploymentWorkflowReference(BaseModel):
+    etl_object_id: int
+    mapping_name: str
+    workflow_id: str
+    branch_name: str
+
+
 class StartDeploymentResponse(BaseModel):
     workflow_id: str
+    workflow_ids: list[str] = Field(default_factory=list)
+    migration_id: str
     repository_id: int
     status: Literal["QUEUED"]
     mapping_count: int
+    deployments: list[DeploymentWorkflowReference] = Field(default_factory=list)
     message: str
 
 class DeploymentMappingResponse(BaseModel):
@@ -746,3 +897,29 @@ class DeploymentMappingResponse(BaseModel):
     commit_sha: str | None = None
     pull_request_url: str | None = None
     deployment_status: str | None = None
+
+
+class ETLIngestionMethodResponse(BaseModel):
+    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+    method_name: str
+    description: str
+    enabled: bool
+    disabled_reason: str | None = None
+    display_order: int = Field(ge=1)
+
+
+class ETLProductResponse(BaseModel):
+    product_code: Literal["INFORMATICA", "DATASTAGE", "AB_INITIO"]
+    product_name: str
+    description: str
+    enabled: bool
+    disabled_reason: str | None = None
+    icon_key: str
+    display_order: int = Field(ge=1)
+    ingestion_methods: list[ETLIngestionMethodResponse] = Field(
+        default_factory=list
+    )
+
+
+class ETLProductsResponse(BaseModel):
+    products: list[ETLProductResponse] = Field(default_factory=list)

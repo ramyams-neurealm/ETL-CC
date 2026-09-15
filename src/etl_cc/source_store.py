@@ -1,34 +1,87 @@
-"""Temporary durable source store used between analysis and discovery."""
+"""PostgreSQL-backed transient source store.
+
+Uploaded XML is retained only between analysis and discovery. After successful
+canonical mapping persistence, source_content is cleared in the same database
+transaction. No runtime_sources directory is used.
+"""
+from __future__ import annotations
 
 import hashlib
-import json
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from etl_cc.config import PROJECT_ROOT
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-SOURCE_ROOT = PROJECT_ROOT / "runtime_sources"
+from etl_cc.config import settings
+from etl_cc.models import SourceSnapshotETL
 
 
-def save_bytes(connection_type: str, file_name: str, content: bytes) -> tuple[str, Path, str]:
+async def create_source(
+    session: AsyncSession,
+    connection_type: str,
+    manifest: dict,
+    content: bytes | None = None,
+) -> tuple[str, str | None]:
+    if content is not None and len(content) > settings.max_xml_upload_bytes:
+        raise ValueError("The uploaded XML exceeds the configured size limit.")
     source_id = str(uuid4())
-    directory = SOURCE_ROOT / connection_type.lower() / source_id
-    directory.mkdir(parents=True, exist_ok=False)
-    safe_name = Path(file_name).name
-    file_path = directory / safe_name
-    file_path.write_bytes(content)
-    digest = hashlib.sha256(content).hexdigest()
-    return source_id, file_path, digest
+    digest = hashlib.sha256(content).hexdigest() if content is not None else None
+    session.add(SourceSnapshotETL(
+        source_id=source_id,
+        connection_type=connection_type,
+        manifest={**manifest, "source_id": source_id},
+        source_content=content,
+        content_hash=digest,
+        content_size_bytes=len(content or b""),
+        status="PENDING",
+        expires_at=datetime.now(timezone.utc) + timedelta(
+            seconds=settings.source_snapshot_ttl_seconds
+        ),
+    ))
+    await session.flush()
+    return source_id, digest
 
 
-def write_manifest(source_id: str, directory: Path, payload: dict) -> Path:
-    manifest = directory / "source.json"
-    manifest.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    return manifest
+async def update_manifest(session: AsyncSession, source_id: str, manifest: dict) -> None:
+    row = await get_source_row(session, source_id)
+    row.manifest = {**manifest, "source_id": source_id}
+    await session.flush()
 
 
-def load_manifest(source_id: str) -> dict:
-    matches = list(SOURCE_ROOT.glob(f"*/{source_id}/source.json"))
-    if len(matches) != 1:
-        raise FileNotFoundError("Source reference was not found or is ambiguous.")
-    return json.loads(matches[0].read_text(encoding="utf-8"))
+async def get_source_row(session: AsyncSession, source_id: str) -> SourceSnapshotETL:
+    row = await session.scalar(
+        select(SourceSnapshotETL).where(SourceSnapshotETL.source_id == source_id)
+    )
+    if row is None:
+        raise FileNotFoundError("Source reference was not found.")
+    if row.expires_at and row.expires_at < datetime.now(timezone.utc):
+        raise FileNotFoundError("Source reference expired. Analyze the source again.")
+    return row
+
+
+async def load_manifest(session: AsyncSession, source_id: str) -> dict:
+    return dict((await get_source_row(session, source_id)).manifest)
+
+
+async def load_content(session: AsyncSession, source_id: str) -> bytes:
+    row = await get_source_row(session, source_id)
+    if row.source_content is None:
+        raise FileNotFoundError("The temporary XML payload is unavailable.")
+    content = bytes(row.source_content)
+    if hashlib.sha256(content).hexdigest() != row.content_hash:
+        raise ValueError("Source content integrity validation failed.")
+    return content
+
+
+async def consume_source_content(session: AsyncSession, source_id: str) -> None:
+    row = await get_source_row(session, source_id)
+    row.source_content = None
+    row.status = "CANONICALIZED"
+    await session.flush()
+
+
+async def delete_source(session: AsyncSession, source_id: str) -> None:
+    await session.execute(
+        delete(SourceSnapshotETL).where(SourceSnapshotETL.source_id == source_id)
+    )

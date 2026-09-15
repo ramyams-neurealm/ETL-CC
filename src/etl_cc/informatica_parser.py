@@ -1,6 +1,7 @@
 """Reusable secure parser for Informatica PowerCenter XML exports."""
 
 from pathlib import Path
+from io import BytesIO
 from typing import Any
 
 from defusedxml import ElementTree as SafeElementTree
@@ -22,6 +23,7 @@ class InformaticaXMLParserError(ValueError):
 
 
 class InformaticaXMLParser:
+    VALID_PORT_TYPES = {"INPUT", "OUTPUT", "INPUT/OUTPUT", "VARIABLE", "RETURN"}
     """List and parse mappings from a PowerCenter XML export."""
 
     SOURCE_INSTANCE_TYPES = {
@@ -80,6 +82,23 @@ class InformaticaXMLParser:
             or instance.attrib.get("NAME")
         )
 
+    def _validated_port_type(
+        self,
+        field: Any,
+        mapping_name: str,
+        transformation_name: str,
+    ) -> str | None:
+        value = field.attrib.get("PORTTYPE")
+        normalized = (value or "").strip().upper()
+        if normalized and normalized not in self.VALID_PORT_TYPES:
+            raise InformaticaXMLParserError(
+                "Invalid PORTTYPE for "
+                f"{mapping_name}.{transformation_name}."
+                f"{field.attrib.get('NAME', 'UNKNOWN')}: {value!r}. "
+                "Expected INPUT, OUTPUT, INPUT/OUTPUT, VARIABLE, or RETURN."
+            )
+        return value
+
     def _transformation_properties(self, element: Any) -> dict[str, str]:
         """Combine transformation attributes and nested TABLEATTRIBUTE values."""
         properties = self._attrs(element)
@@ -106,6 +125,29 @@ class InformaticaXMLParser:
             )
         return root
 
+
+    def list_mappings_bytes(self, content: bytes, source_reference: str) -> list[MappingSummary]:
+        """List mappings directly from uploaded XML bytes."""
+        root = self._root_stream(BytesIO(content))
+        return self._list_mappings_root(root, source_reference)
+
+    def parse_selected_bytes(
+        self, content: bytes, selected_keys: set[str] | None,
+        source_vendor: str, source_reference: str,
+    ) -> list[CanonicalMapping]:
+        """Parse canonical mappings directly from XML bytes."""
+        root = self._root_stream(BytesIO(content))
+        return self._parse_selected_root(root, selected_keys, source_vendor, source_reference)
+
+    def _root_stream(self, stream):
+        try:
+            root = SafeElementTree.parse(stream).getroot()
+        except Exception as exc:
+            raise InformaticaXMLParserError("The file is not valid XML.") from exc
+        if self._tag(root) != "POWERMART":
+            raise InformaticaXMLParserError("The XML root must be POWERMART for a PowerCenter export.")
+        return root
+
     def list_mappings(
         self,
         file_path: Path,
@@ -113,6 +155,9 @@ class InformaticaXMLParser:
     ) -> list[MappingSummary]:
         """Return selectable mapping summaries from one XML export."""
         root = self._root(file_path)
+        return self._list_mappings_root(root, source_reference)
+
+    def _list_mappings_root(self, root, source_reference: str) -> list[MappingSummary]:
         mappings: list[MappingSummary] = []
 
         for folder in (
@@ -149,6 +194,9 @@ class InformaticaXMLParser:
     ) -> list[CanonicalMapping]:
         """Parse selected mappings, or all mappings when selection is None."""
         root = self._root(file_path)
+        return self._parse_selected_root(root, selected_keys, source_vendor, source_reference)
+
+    def _parse_selected_root(self, root, selected_keys, source_vendor, source_reference):
         results: list[CanonicalMapping] = []
 
         for folder in (
