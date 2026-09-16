@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from etl_cc.agents.discovery_agent import DiscoveryAgent
 from etl_cc.agents.lineage_agent import LineageAgent
+from etl_cc.ab_initio_parser import AbInitioGraphParser
 from etl_cc.config import settings
 from etl_cc.connectors import GitHubSource, MappingSource, PowerCenterSource
 from etl_cc.database import SessionFactory
@@ -66,6 +67,14 @@ async def _source(session: AsyncSession, repository: RepositoryETL, workflow: Wo
 async def _load_mappings(session: AsyncSession, repository: RepositoryETL, workflow: WorkflowRunETL) -> list[CanonicalMapping]:
     selected = workflow.scope_payload.get("selected_mapping_keys") or None
     manifest = await load_manifest(session, workflow.scope_payload["source_id"])
+    if manifest.get("product_code") == "AB_INITIO":
+        content = await load_content(session, workflow.scope_payload["source_id"])
+        return AbInitioGraphParser().parse_selected_bytes(
+            content,
+            set(selected) if selected else None,
+            "AB_INITIO",
+            manifest["config"]["original_file_name"],
+        )
     if manifest.get("product_code") != "INFORMATICA":
         raise ValueError(f"Discovery is not implemented for {manifest.get('product_code')}.")
     if repository.connection_type == "XML_UPLOAD":
@@ -252,7 +261,7 @@ async def _process(workflow_id: int) -> None:
         workflow.failure_stage = None
         workflow.failure_reason = None
         workflow.completed_at = datetime.now(timezone.utc)
-        if repository.connection_type == "XML_UPLOAD":
+        if repository.connection_type in {"XML_UPLOAD", "AB_INITIO_GRAPH_UPLOAD"}:
             await consume_source_content(session, workflow.scope_payload["source_id"])
         await _event(session, workflow.id, "DEPENDENCY_PLANNING_WORKFLOW_COMPLETED", "COMPLETED", "Discovery, lineage, and dependency planning completed.", 100, {"mapping_count": total}, "DEPENDENCY_PLANNING")
         await session.commit()
@@ -267,7 +276,18 @@ async def _fail(workflow_id: int, exc: Exception) -> None:
             workflow.failure_stage = workflow.current_stage or "DISCOVERY"
             workflow.failure_reason = str(exc)[:4000]
             workflow.completed_at = datetime.now(timezone.utc)
-            await _event(session, workflow.id, "WORKFLOW_FAILED", "FAILED", "Workflow failed.", 100, {"error_type": type(exc).__name__})
+            await _event(
+                session,
+                workflow.id,
+                "WORKFLOW_FAILED",
+                "FAILED",
+                "Workflow failed.",
+                100,
+                {
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc)[:4000],
+                },
+            )
             await session.commit()
 
 

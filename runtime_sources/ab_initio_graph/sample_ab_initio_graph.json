@@ -1,0 +1,75 @@
+{
+  "format": "AB_INITIO_GRAPH_JSON",
+  "format_version": "1.0",
+  "project": "accounts",
+  "graphs": [
+    {
+      "name": "g_load_active_accounts",
+      "version": "synthetic-v1",
+      "parameters": [
+        {
+          "name": "LOAD_DATE",
+          "parameter_type": "DATE",
+          "data_type": "DATE",
+          "default_value": "CURRENT_DATE",
+          "scope": "GRAPH"
+        }
+      ],
+      "datasets": {
+        "sources": [
+          {
+            "name": "SRC_ACCOUNT",
+            "connection_name": "synthetic_accounts",
+            "fields": [
+              {"name": "ACCOUNT_ID", "data_type": "INTEGER", "nullable": false},
+              {"name": "ACCOUNT_STATUS", "data_type": "STRING", "nullable": false},
+              {"name": "ACCOUNT_BALANCE", "data_type": "DECIMAL", "precision": 12, "scale": 2, "nullable": true}
+            ]
+          }
+        ],
+        "targets": [
+          {
+            "name": "TGT_ACTIVE_ACCOUNT",
+            "connection_name": "synthetic_target",
+            "fields": [
+              {"name": "ACCOUNT_ID", "data_type": "INTEGER", "nullable": false},
+              {"name": "ACCOUNT_BALANCE", "data_type": "DECIMAL", "precision": 12, "scale": 2, "nullable": true},
+              {"name": "LOAD_DATE", "data_type": "DATE", "nullable": false}
+            ]
+          }
+        ]
+      },
+      "components": [
+        {
+          "name": "FILTER_ACTIVE",
+          "type": "FILTER",
+          "properties": {"condition": "ACCOUNT_STATUS == \\\"ACTIVE\\\""}
+        },
+        {
+          "name": "REFORMAT_ACCOUNT",
+          "type": "REFORMAT",
+          "ports": [
+            {"name": "ACCOUNT_ID", "direction": "OUTPUT", "expression": "ACCOUNT_ID"},
+            {"name": "ACCOUNT_BALANCE", "direction": "OUTPUT", "expression": "ACCOUNT_BALANCE"},
+            {"name": "LOAD_DATE", "direction": "OUTPUT", "expression": "$LOAD_DATE"}
+          ]
+        }
+      ],
+      "edges": [
+        {"from_instance": "SRC_ACCOUNT", "to_instance": "FILTER_ACTIVE"},
+        {"from_instance": "FILTER_ACTIVE", "to_instance": "REFORMAT_ACCOUNT"},
+        {"from_instance": "REFORMAT_ACCOUNT", "to_instance": "TGT_ACTIVE_ACCOUNT"}
+      ],
+      "field_links": [
+        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_ID", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_ID"},
+        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_STATUS", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_STATUS"},
+        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_BALANCE", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_BALANCE"},
+        {"from_instance": "FILTER_ACTIVE", "from_field": "ACCOUNT_ID", "to_instance": "REFORMAT_ACCOUNT", "to_field": "ACCOUNT_ID"},
+        {"from_instance": "FILTER_ACTIVE", "from_field": "ACCOUNT_BALANCE", "to_instance": "REFORMAT_ACCOUNT", "to_field": "ACCOUNT_BALANCE"},
+        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "ACCOUNT_ID", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "ACCOUNT_ID"},
+        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "ACCOUNT_BALANCE", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "ACCOUNT_BALANCE"},
+        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "LOAD_DATE", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "LOAD_DATE"}
+      ]
+    }
+  ]
+}

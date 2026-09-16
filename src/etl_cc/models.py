@@ -26,7 +26,12 @@ from etl_cc.database import Base
 
 ETL_SCHEMA = settings.pg_schema
 ProductCode = Literal["INFORMATICA", "DATASTAGE", "AB_INITIO"]
-MethodCode = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+MethodCode = Literal[
+    "POWERCENTER",
+    "GITHUB",
+    "XML_UPLOAD",
+    "AB_INITIO_GRAPH_UPLOAD",
+]
 ConnectionType = MethodCode
 EnvironmentType = Literal["DEV", "STAGING", "PROD"]
 
@@ -62,7 +67,7 @@ class SourceSnapshotETL(Base):
 
 
 class RepositoryETL(Base):
-    """Store one configured PowerCenter, GitHub, or XML-upload source."""
+    """Store one configured ETL source and its ingestion method."""
 
     __tablename__ = "repository_etl"
     __table_args__ = (
@@ -72,7 +77,7 @@ class RepositoryETL(Base):
             name="uq_repository_etl_name_environment",
         ),
         CheckConstraint(
-            "connection_type IN ('POWERCENTER', 'GITHUB', 'XML_UPLOAD')",
+            "connection_type IN ('POWERCENTER', 'GITHUB', 'XML_UPLOAD', 'AB_INITIO_GRAPH_UPLOAD')",
             name="ck_repository_etl_connection_type",
         ),
         Index("ix_repository_etl_connection_type", "connection_type"),
@@ -81,7 +86,7 @@ class RepositoryETL(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     repository_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    source_type: Mapped[str] = mapped_column(String(50), nullable=False, default="INFORMATICA")
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
     connection_type: Mapped[str] = mapped_column(String(30), nullable=False)
     environment: Mapped[str] = mapped_column(String(30), nullable=False)
     connection_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -396,6 +401,13 @@ class GitHubConnectionRequest(BaseModel):
     branch: str = Field(default="main", min_length=1, max_length=255)
     folder_path: str = Field(default="", max_length=1000)
     access_token: SecretStr | None = None
+
+
+class AbInitioGraphUploadRequest(BaseModel):
+    product_code: Literal["AB_INITIO"] = "AB_INITIO"
+    method_code: Literal["AB_INITIO_GRAPH_UPLOAD"] = "AB_INITIO_GRAPH_UPLOAD"
+    connection_name: str = Field(min_length=2, max_length=200)
+    environment: EnvironmentType
 
 
 class MappingSummary(BaseModel):
@@ -900,7 +912,7 @@ class DeploymentMappingResponse(BaseModel):
 
 
 class ETLIngestionMethodResponse(BaseModel):
-    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+    method_code: MethodCode
     method_name: str
     description: str
     enabled: bool

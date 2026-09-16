@@ -66,7 +66,7 @@ class CritiqueAgent:
             "deterministic_checks": [item.model_dump() for item in checks],
         }
         prompt = """Review generated Databricks PySpark against supplied
-Informatica evidence. Never invent requirements. Treat failed deterministic
+    source-platform evidence. Never invent requirements. Treat failed deterministic
 checks, missing grounded business rules, missing canonical target fields,
 syntax errors, secrets, TODOs, or placeholders as requiring revision.
 

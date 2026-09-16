@@ -31,6 +31,7 @@ from etl_cc.models import (
     DependencyPlanResponse,
     DiscoverySummaryResponse,
     GitHubConnectionRequest,
+    AbInitioGraphUploadRequest,
     MappingDiscoveryDetailsResponse,
     MappingInventoryResponse,
     MappingLineageDetailsResponse,
@@ -61,10 +62,12 @@ from etl_cc.models import (
     ETLProductsResponse,
     ETLProductResponse,
     ETLIngestionMethodResponse,
+    EnvironmentType,
 )
 from etl_cc.security import ConnectionTestTokenError
 from etl_cc.services import (
     analyze_github,
+    analyze_ab_initio_graph,
     analyze_powercenter,
     analyze_xml_upload,
     get_artifact_content,
@@ -141,6 +144,7 @@ async def list_etl_products() -> ETLProductsResponse:
     Disabled products remain visible so the UI can display them as unavailable.
     """
     informatica_enabled = bool(settings.enable_informatica)
+    ab_initio_enabled = bool(settings.enable_ab_initio)
 
     methods = [
         ETLIngestionMethodResponse(
@@ -235,11 +239,28 @@ async def list_etl_products() -> ETLProductsResponse:
                 product_code="AB_INITIO",
                 product_name="Ab Initio",
                 description="Ab Initio graphs",
-                enabled=True,
-                disabled_reason=None,
+                enabled=ab_initio_enabled,
+                disabled_reason=(
+                    None
+                    if ab_initio_enabled
+                    else "Ab Initio ingestion is not enabled."
+                ),
                 icon_key="ab-initio",
                 display_order=3,
-                ingestion_methods=[],
+                ingestion_methods=[
+                    ETLIngestionMethodResponse(
+                        method_code="AB_INITIO_GRAPH_UPLOAD",
+                        method_name="Ab Initio Graph Upload",
+                        description="Analyze a portable Ab Initio graph export.",
+                        enabled=ab_initio_enabled,
+                        disabled_reason=(
+                            None
+                            if ab_initio_enabled
+                            else "Ab Initio ingestion is not enabled."
+                        ),
+                        display_order=1,
+                    )
+                ],
             ),
         ]
     )
@@ -347,6 +368,42 @@ async def analyze_xml(
             detail={
                 "status": "FAILED",
                 "stage": "XML_VALIDATION",
+                "reason": str(exc),
+            },
+        ) from exc
+
+
+@router.post(
+    "/sources/ab-initio/analyze",
+    response_model=SourceAnalysisResponse,
+    tags=["Sources"],
+)
+async def analyze_ab_initio(
+    connection_name: str = Form(...),
+    environment: EnvironmentType = Form(...),
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        if not settings.enable_ab_initio:
+            raise ValueError("Ab Initio ingestion is not enabled.")
+        request = AbInitioGraphUploadRequest(
+            connection_name=connection_name,
+            environment=environment,
+        )
+        return await analyze_ab_initio_graph(
+            session,
+            request,
+            file.filename or "ab_initio_graph.json",
+            await file.read(),
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "FAILED",
+                "stage": "AB_INITIO_VALIDATION",
                 "reason": str(exc),
             },
         ) from exc

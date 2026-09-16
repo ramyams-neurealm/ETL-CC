@@ -16,6 +16,7 @@ from etl_cc.economics import (
     calculate_conversion_economics,
     calculate_discovery_economics,
 )
+from etl_cc.ab_initio_parser import AbInitioGraphParser
 from etl_cc.connectors import GitHubDeploymentTargetConnector, GitHubSource, PowerCenterSource
 from etl_cc.informatica_parser import InformaticaXMLParser
 from etl_cc.models import (
@@ -31,6 +32,7 @@ from etl_cc.models import (
     ETLObjectETL,
     GeneratedArtifactETL,
     GitHubConnectionRequest,
+    AbInitioGraphUploadRequest,
     MappingDiscoveryDetailsResponse,
     MappingInventoryResponse,
     MappingLineageDetailsResponse,
@@ -74,6 +76,7 @@ SUPPORTED_SOURCE_SELECTIONS = {
     ("INFORMATICA", "POWERCENTER"),
     ("INFORMATICA", "GITHUB"),
     ("INFORMATICA", "XML_UPLOAD"),
+    ("AB_INITIO", "AB_INITIO_GRAPH_UPLOAD"),
 }
 
 def _validate_source_selection(product_code: str, method_code: str, expected_method: str) -> None:
@@ -189,6 +192,64 @@ async def analyze_xml_upload(
     return response
 
 
+async def analyze_ab_initio_graph(
+    session: AsyncSession,
+    request: AbInitioGraphUploadRequest,
+    file_name: str,
+    content: bytes,
+) -> SourceAnalysisResponse:
+    _validate_source_selection(
+        request.product_code,
+        request.method_code,
+        "AB_INITIO_GRAPH_UPLOAD",
+    )
+    if not file_name.lower().endswith(".json"):
+        raise ValueError("Only .json Ab Initio graph exports are accepted.")
+    if not content:
+        raise ValueError("The uploaded Ab Initio graph is empty.")
+
+    parser = AbInitioGraphParser()
+    source_reference = Path(file_name).name
+    mappings = parser.list_mappings_bytes(content, source_reference)
+    source_id, digest = await create_source(
+        session,
+        "AB_INITIO_GRAPH_UPLOAD",
+        {},
+        content,
+    )
+    payload = {
+        "connection_name": request.connection_name,
+        "environment": request.environment,
+        "file_name": source_reference,
+        "content_hash": digest,
+    }
+    response, fingerprint = _response(
+        request.product_code,
+        request.method_code,
+        source_id,
+        payload,
+        mappings,
+        "Ab Initio graph validated and graphs loaded.",
+    )
+    await update_manifest(session, source_id, {
+        "fingerprint": fingerprint,
+        "product_code": request.product_code,
+        "method_code": request.method_code,
+        "connection_type": request.method_code,
+        "connection_name": request.connection_name,
+        "environment": request.environment,
+        "config": {
+            "original_file_name": source_reference,
+            "source_format": AbInitioGraphParser.FORMAT,
+            "content_hash": digest,
+            "file_size": len(content),
+        },
+        "credential_ciphertext": None,
+    })
+    await session.commit()
+    return response
+
+
 async def start_discovery(
     session: AsyncSession,
     request: StartDiscoveryRequest,
@@ -197,6 +258,11 @@ async def start_discovery(
     verify_connection_test_token(request.test_token, manifest["fingerprint"])
     if request.scope_type == "SELECTED_MAPPINGS" and not request.selected_mapping_keys:
         raise ValueError("Select at least one mapping.")
+    selected_mapping_keys = (
+        request.selected_mapping_keys
+        if request.scope_type == "SELECTED_MAPPINGS"
+        else []
+    )
     repository = RepositoryETL(
         repository_name=manifest["connection_name"],
         source_type=manifest["product_code"],
@@ -224,7 +290,7 @@ async def start_discovery(
             "method_code": manifest["method_code"],
             "connection_type": manifest["connection_type"],
             "scope_type": request.scope_type,
-            "selected_mapping_keys": request.selected_mapping_keys,
+            "selected_mapping_keys": selected_mapping_keys,
         },
     )
     session.add(workflow)

@@ -159,6 +159,9 @@ PYSPARK_CODE requirements:
 - Contain transformation logic only.
 - Preserve filters, expressions, target names, decimal precision, scale, and
   documented null behavior.
+- Preserve runtime expressions such as CURRENT_DATE, current_datetime(), and
+    parameter references as runtime behavior. Never replace them with a fixed
+    calendar date or another time-dependent literal.
 - Select target columns explicitly in target-schema order.
 - A nullable field used in a filter follows normal Spark SQL three-valued
   semantics unless supplied evidence defines different null behavior. Do not

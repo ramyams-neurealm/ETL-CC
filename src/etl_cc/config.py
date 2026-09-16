@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     informatica_export_directory: str = "runtime_exports"
     worker_poll_seconds: float = 2.0
     source_snapshot_ttl_seconds: int = 1800
+    max_source_upload_bytes: int = 26214400
     max_xml_upload_bytes: int = 26214400
     memory_workspace_root: str = "/dev/shm/etl_cc"
 
