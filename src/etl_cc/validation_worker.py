@@ -21,7 +21,7 @@ from etl_cc.connectors import load_postgresql_table
 from etl_cc.security import validation_credential_cipher
 from etl_cc.models import ValidationDatabaseConnectionETL
 from etl_cc.database import SessionFactory
-from etl_cc.logging_config import configure_logging, log_event, log_exception
+from etl_cc.logging_config import banner, configure_logging, log_event, log_exception, metric, stage_completed, stage_failed, stage_started, stage_warning
 from etl_cc.models import (
     AgentResponseETL,
     ArtifactContentETL,
@@ -170,7 +170,7 @@ async def _audit_stage(
         status=stage.status,
         input_tokens=stage.input_tokens,
         output_tokens=stage.output_tokens,
-        response_payload=stage.response_payload,
+        stage_summary=stage.response_payload,
         error_message=stage.error_message,
     )
     return audit
@@ -350,6 +350,7 @@ async def _persist_result(
 
 
 async def _process(workflow_id: int) -> None:
+    banner(logger, "Zero-Touch Validation Workflow Started", workflow_run_id=workflow_id)
     """Run consolidated ValidationAgent for each selected mapping."""
     async with SessionFactory() as session:
         workflow = await session.get(WorkflowRunETL, workflow_id)
@@ -475,9 +476,9 @@ async def _process(workflow_id: int) -> None:
                 mapping_name=mapping.object_name,
                 input_mode=input_mode,
                 requested_row_count=requested_row_count,
-                canonical_mapping=canonical.model_dump(mode="json"),
-                discovery=discovery,
-                lineage=mapping.lineage or {},
+                source_count=len(canonical.sources),
+                target_count=len(canonical.targets),
+                transformation_count=len(canonical.transformations),
                 artifact_types=sorted(artifact_paths),
             )
             try:
@@ -510,7 +511,13 @@ async def _process(workflow_id: int) -> None:
                 repository_id=workflow.repository_id,
                 etl_object_id=mapping.id,
                 mapping_name=mapping.object_name,
-                validation_result=result.model_dump(mode="json"),
+                status=result.status,
+                deployable=result.deployable,
+                match_percentage=result.match_percentage,
+                rows_compared=result.rows_compared,
+                confidence_index=result.confidence_index,
+                failure_reason=result.failure_reason,
+                recommendation=result.recommendation,
             )
 
             passed = result.status == "PASSED" and result.deployable

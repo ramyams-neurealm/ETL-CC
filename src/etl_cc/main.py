@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from etl_cc.api import router
 from etl_cc.config import settings
-from etl_cc.logging_config import configure_logging, log_event, log_exception
+from etl_cc.logging_config import banner, configure_logging, log_event, log_exception
 
 
 app = FastAPI(
@@ -23,6 +23,18 @@ app.add_middleware(
 )
 
 logger = configure_logging("API")
+
+
+@app.on_event("startup")
+async def application_startup_logging() -> None:
+    banner(
+        logger,
+        "ETL Migration Command Center Started",
+        application=settings.app_name,
+        api_prefix=settings.api_prefix,
+        documentation="/docs",
+        log_file="logs/etl_cc.log",
+    )
 @app.middleware("http")
 async def operational_logging(request: Request, call_next):
     started=time.perf_counter();log_event(logger,"HTTP_REQUEST_STARTED",method=request.method,path=request.url.path,query=dict(request.query_params))

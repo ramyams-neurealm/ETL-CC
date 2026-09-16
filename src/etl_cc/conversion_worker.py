@@ -154,7 +154,6 @@ async def _audit_start(
         agent_name=agent.AGENT_NAME,
         stage_name=agent.STAGE_NAME,
         attempt_number=attempt,
-        request_payload=request_payload,
     )
     return audit
 
@@ -189,7 +188,8 @@ async def _audit_complete(
         model_name=audit.model_name,
         input_tokens=audit.input_tokens,
         output_tokens=audit.output_tokens,
-        response_payload=audit.response_payload,
+        status=audit.status,
+        result_summary=audit.response_payload,
     )
 
 

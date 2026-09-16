@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field
+from etl_cc.logging_config import configure_logging, metric, stage_completed, stage_failed, stage_started
 
 
 class DeploymentArtifact(BaseModel):
@@ -64,6 +65,9 @@ class GitDeploymentResult(BaseModel):
     failure_reason: str | None = None
 
 
+logger = configure_logging("GIT_DEPLOYMENT_AGENT")
+
+
 class GitDeploymentAgent:
     AGENT_NAME = "GIT_DEPLOYMENT_AGENT"
     AGENT_VERSION = "1.0.0"
@@ -78,6 +82,7 @@ class GitDeploymentAgent:
     }
 
     def run(self, context: GitDeploymentContext) -> GitDeploymentResult:
+        stage_started(logger, "GIT_DEPLOYMENT", workflow_id=context.workflow_id, mapping=context.mapping_name, branch=context.branch_name, artifact_count=len(context.artifacts))
         stages: list[DeploymentStage] = []
         try:
             self._validate_context(context)
@@ -110,8 +115,11 @@ class GitDeploymentAgent:
                     stages.append(DeploymentStage(stage_name="PULL_REQUEST", status="COMPLETED", details="Pull request was created or already exists.", evidence={"pull_request_url": pr_url}))
                 if askpass:
                     askpass.unlink(missing_ok=True)
+                metric(logger, "GIT_DEPLOYMENT", mapping=context.mapping_name, branch=context.branch_name, commit_sha=commit_sha, deployed_paths=len(deployed_paths))
+                stage_completed(logger, "GIT_DEPLOYMENT", mapping=context.mapping_name, branch=context.branch_name)
                 return GitDeploymentResult(status="DEPLOYED", mapping_name=context.mapping_name, branch_name=context.branch_name, commit_sha=commit_sha, remote_url=context.remote_url, pull_request_url=pr_url, deployed_paths=deployed_paths, stages=stages)
         except Exception as exc:
+            stage_failed(logger, "GIT_DEPLOYMENT", exc, mapping=context.mapping_name, branch=context.branch_name)
             stages.append(DeploymentStage(stage_name="GIT_DEPLOYMENT", status="FAILED", details=str(exc)[:4000]))
             return GitDeploymentResult(status="FAILED", mapping_name=context.mapping_name, branch_name=context.branch_name, remote_url=context.remote_url, stages=stages, failure_reason=str(exc)[:4000])
 

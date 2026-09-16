@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from etl_cc.agents.rag_retrieval_agent import RAGRetrievalResult
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.models import CanonicalMapping
+from etl_cc.logging_config import configure_logging, metric, stage_completed, stage_started
 
 
 class GeneratedFile(BaseModel):
@@ -35,6 +36,9 @@ class ConversionResult(BaseModel):
 
 class ConversionOutputValidationError(RuntimeError):
     """Raised when generated artifacts violate the conversion contract."""
+
+
+logger = configure_logging("CONVERSION_AGENT")
 
 
 class ConversionAgent:
@@ -109,6 +113,7 @@ class ConversionAgent:
         critique_feedback: list[dict[str, Any]] | None = None,
     ) -> ConversionResult:
         """Generate and validate one conversion result."""
+        stage_started(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name, sources=len(mapping.sources), targets=len(mapping.targets), transformations=len(mapping.transformations))
 
         evidence = {
             "canonical_mapping": mapping.model_dump(mode="json"),
@@ -240,6 +245,8 @@ Return only the requested structured output.
         self._normalize_configuration(parsed, mapping)
         self._capture_usage(raw)
         self._validate_result(parsed, mapping)
+        metric(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name, artifacts=len(parsed.generated_files), input_tokens=self.input_tokens, output_tokens=self.output_tokens, confidence=parsed.confidence)
+        stage_completed(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name)
         return parsed
 
     def _normalize_configuration(

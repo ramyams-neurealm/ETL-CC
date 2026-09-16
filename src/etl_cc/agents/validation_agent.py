@@ -33,6 +33,10 @@ from etl_cc.agents.unit_test_execution_agent import UnitTestExecutionAgent
 from etl_cc.config import settings
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.models import CanonicalMapping
+from etl_cc.logging_config import configure_logging, metric, stage_completed, stage_failed, stage_started
+
+
+logger = configure_logging("VALIDATION_AGENT")
 
 
 class ReferenceExecutionMode(StrEnum):
@@ -2535,6 +2539,7 @@ class ValidationAgent:
         if isinstance(context, dict):
             context = ValidationContext.model_validate(context)
         mapping = context.mapping
+        stage_started(logger, "ZERO_TOUCH_VALIDATION", workflow_id=context.workflow_id, mapping=mapping.mapping_name, input_mode=context.input_mode, requested_rows=context.requested_row_count, minimum_parity=context.minimum_functional_parity)
         artifacts = self._artifacts(context.artifact_paths)
         stages: list[ValidationStageResult] = []
         tests: list[ValidationTestResult] = []
@@ -2543,10 +2548,12 @@ class ValidationAgent:
         plan_agent = TestPlanAgent()
         plan = plan_agent.run(mapping, context.discovery)
         stages.append(self._stage(plan_agent, "COMPLETED", plan.model_dump(mode="json")))
+        stage_completed(logger, "TEST_PLANNING", mapping=mapping.mapping_name, test_count=len(plan.test_cases))
 
         synthetic_agent = SyntheticTestDataGenerator()
         synthetic = await synthetic_agent.run(mapping, context.discovery, context.lineage)
         stages.append(self._stage(synthetic_agent, "COMPLETED", synthetic.model_dump(mode="json")))
+        stage_completed(logger, "SYNTHETIC_DATA_GENERATION", mapping=mapping.mapping_name, scenarios=len(synthetic.scenarios), input_tokens=synthetic_agent.input_tokens, output_tokens=synthetic_agent.output_tokens)
         semantic_rows = [
             row.as_dict()
             for scenario in synthetic.scenarios
@@ -2611,6 +2618,7 @@ class ValidationAgent:
             physical_rows=validation_rows,
         )
         stages.append(self._stage(validator, "COMPLETED", synthetic_validation.model_dump(mode="json")))
+        metric(logger, "SYNTHETIC_DATA_VALIDATION", mapping=mapping.mapping_name, status=synthetic_validation.status, valid_rows=synthetic_validation.valid_row_count, schema_coverage=synthetic_validation.schema_coverage, scenario_coverage=synthetic_validation.scenario_coverage)
         tests.extend(self._synthetic_tests(synthetic, synthetic_validation))
         store = ValidationDataStore()
         input_path = store.write(
@@ -2657,6 +2665,7 @@ class ValidationAgent:
         static_agent = StaticArtifactValidator()
         static = static_agent.run(artifacts)
         stages.append(self._stage(static_agent, "COMPLETED", static.model_dump(mode="json")))
+        metric(logger, "STATIC_VALIDATION", mapping=mapping.mapping_name, status=static.status, passed=static.passed_count, failed=static.failed_count)
         tests.extend(self._static_tests(static))
 
         unit_agent = UnitTestExecutionAgent()
@@ -2672,6 +2681,7 @@ class ValidationAgent:
             )
         stages.append(self._stage(unit_agent, "COMPLETED", unit.model_dump(mode="json")))
         tests.extend(self._unit_tests(unit))
+        metric(logger, "UNIT_TEST_EXECUTION", mapping=mapping.mapping_name, status=unit.status, passed=getattr(unit, "passed", 0), failed=getattr(unit, "failed", 0))
 
         code = artifacts["PYSPARK_CODE"].read_text(encoding="utf-8")
         config = artifacts["CONFIGURATION"].read_text(encoding="utf-8")
@@ -2680,6 +2690,7 @@ class ValidationAgent:
         coverage = coverage_agent.run(mapping, context.discovery, context.lineage, code, config, unit_text, context.minimum_functional_parity)
         stages.append(self._stage(coverage_agent, "COMPLETED", coverage.model_dump(mode="json")))
         tests.extend(self._coverage_tests(coverage, context.minimum_functional_parity))
+        metric(logger, "STATIC_IMPLEMENTATION_COVERAGE", mapping=mapping.mapping_name, overall=coverage.overall_functional_parity, business_rules=coverage.business_rule_coverage, lineage=coverage.lineage_coverage)
 
         reference_executor = RelationalIRExecutor()
         primary_source_name = (
@@ -2718,6 +2729,7 @@ class ValidationAgent:
         target_agent = TargetPySparkExecutor()
         target = target_agent.run(artifacts["PYSPARK_CODE"], mapping, input_datasets, settings.validation_test_timeout_seconds) if synthetic_validation.status == "PASSED" and static.safe_to_execute_tests else TargetExecutionResult(status="SKIPPED", error_message="Synthetic or static validation blocked target execution.")
         stages.append(self._stage(target_agent, "COMPLETED" if target.status == "PASSED" else target.status, target.model_dump(mode="json"), target.error_message))
+        metric(logger, "TARGET_EXECUTION", mapping=mapping.mapping_name, status=target.status, rows=target.row_count)
         target_path = None
         if target.status == "PASSED":
             target_path = store.write(context.workflow_id, mapping.mapping_name, "target_output.json", target.rows)
@@ -2735,6 +2747,7 @@ class ValidationAgent:
                 reference_plan.comparison_keys,
             )
             stages.append(self._stage(comparator, "COMPLETED", match.model_dump(mode="json")))
+            metric(logger, "MATCHFLOW", mapping=mapping.mapping_name, match_percentage=match.match_percentage, rows_compared=match.rows_compared, missing=match.missing_rows, additional=match.additional_rows, different=match.different_rows)
         else:
             stages.append(
                 self._stage(
@@ -2782,6 +2795,11 @@ class ValidationAgent:
             threshold,
             context.minimum_functional_parity,
         )
+        metric(logger, "VALIDATION_FINAL", mapping=mapping.mapping_name, status="PASSED" if passed else "FAILED", deployable=passed, confidence=confidence, match_percentage=match.match_percentage if match else None)
+        if passed:
+            stage_completed(logger, "ZERO_TOUCH_VALIDATION", mapping=mapping.mapping_name)
+        else:
+            stage_failed(logger, "ZERO_TOUCH_VALIDATION", reason, mapping=mapping.mapping_name)
         return ValidationResult(
             mapping_name=mapping.mapping_name,
             status="PASSED" if passed else "FAILED",
