@@ -10,6 +10,10 @@ Current implementation focus:
 5. Retrieve and save full mapping metadata
 6. Analyze portable Ab Initio graph JSON exports
 
+For the complete architecture, API, worker, database, validation, deployment,
+and knowledge-transfer guide, see
+`docs/PROJECT_KNOWLEDGE_TRANSFER.md`.
+
 Run:
 ```bash
 pip install -r requirements.txt
