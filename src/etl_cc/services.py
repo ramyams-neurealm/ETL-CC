@@ -18,6 +18,7 @@ from etl_cc.economics import (
 )
 from etl_cc.connectors import GitHubDeploymentTargetConnector, GitHubSource, PowerCenterSource
 from etl_cc.informatica_parser import InformaticaXMLParser
+from etl_cc.parser_factory import get_parser
 from etl_cc.models import (
     AgentResponseETL,
     AgentResponseSummary,
@@ -74,6 +75,7 @@ SUPPORTED_SOURCE_SELECTIONS = {
     ("INFORMATICA", "POWERCENTER"),
     ("INFORMATICA", "GITHUB"),
     ("INFORMATICA", "XML_UPLOAD"),
+    ("DATASTAGE", "DSX_UPLOAD"),
 }
 
 def _validate_source_selection(product_code: str, method_code: str, expected_method: str) -> None:
@@ -166,19 +168,28 @@ async def analyze_xml_upload(
     file_name: str,
     content: bytes,
 ) -> SourceAnalysisResponse:
-    _validate_source_selection(product_code, method_code, "XML_UPLOAD")
-    if not file_name.lower().endswith(".xml"):
-        raise ValueError("Only .xml files are accepted.")
+    if method_code == "XML_UPLOAD":
+        _validate_source_selection(product_code, method_code, "XML_UPLOAD")
+        expected_suffix = ".xml"
+        message = "Informatica XML validated and mappings loaded."
+    elif method_code == "DSX_UPLOAD":
+        _validate_source_selection(product_code, method_code, "DSX_UPLOAD")
+        expected_suffix = ".dsx"
+        message = "DataStage DSX validated and jobs loaded."
+    else:
+        raise ValueError("XML upload analysis requires XML_UPLOAD or DSX_UPLOAD.")
+    if not file_name.lower().endswith(expected_suffix):
+        raise ValueError(f"Only {expected_suffix} files are accepted.")
     if not content:
         raise ValueError("The uploaded XML file is empty.")
-    parser = InformaticaXMLParser()
+    parser = get_parser(product_code, method_code)
     mappings = parser.list_mappings_bytes(content, Path(file_name).name)
-    source_id, digest = await create_source(session, "XML_UPLOAD", {}, content)
+    source_id, digest = await create_source(session, method_code, {}, content)
     payload = {
         "connection_name": connection_name, "environment": environment,
         "file_name": Path(file_name).name, "content_hash": digest,
     }
-    response, fingerprint = _response(product_code, method_code, source_id, payload, mappings, "Informatica XML validated and mappings loaded.")
+    response, fingerprint = _response(product_code, method_code, source_id, payload, mappings, message)
     await update_manifest(session, source_id, {
         "fingerprint": fingerprint, "product_code": product_code, "method_code": method_code, "connection_type": method_code,
         "connection_name": connection_name, "environment": environment,
@@ -206,7 +217,11 @@ async def start_discovery(
         credential_ciphertext=manifest.get("credential_ciphertext"),
         credential_algorithm="FERNET" if manifest.get("credential_ciphertext") else None,
         credential_key_version=settings.etl_credential_key_version if manifest.get("credential_ciphertext") else None,
-        connection_status="CONNECTED" if manifest["connection_type"] != "XML_UPLOAD" else "ANALYZED",
+        connection_status=(
+            "ANALYZED"
+            if manifest["connection_type"] in {"XML_UPLOAD", "DSX_UPLOAD"}
+            else "CONNECTED"
+        ),
         last_tested_at=datetime.now(timezone.utc),
     )
     session.add(repository)

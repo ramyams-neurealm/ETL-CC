@@ -18,6 +18,7 @@ from etl_cc.database import SessionFactory
 from etl_cc.logging_config import configure_logging, log_event, log_exception
 from etl_cc.dependency_planner import DependencyPlanner
 from etl_cc.informatica_parser import InformaticaXMLParser
+from etl_cc.parser_factory import get_parser
 from etl_cc.models import AgentResponseETL, CanonicalMapping, ETLObjectETL, RepositoryETL, WorkflowEventETL, WorkflowRunETL
 from etl_cc.security import credential_cipher
 from etl_cc.source_store import consume_source_content, load_content, load_manifest
@@ -66,11 +67,14 @@ async def _source(session: AsyncSession, repository: RepositoryETL, workflow: Wo
 async def _load_mappings(session: AsyncSession, repository: RepositoryETL, workflow: WorkflowRunETL) -> list[CanonicalMapping]:
     selected = workflow.scope_payload.get("selected_mapping_keys") or None
     manifest = await load_manifest(session, workflow.scope_payload["source_id"])
-    if manifest.get("product_code") != "INFORMATICA":
+    if manifest.get("product_code") not in {"INFORMATICA", "DATASTAGE"}:
         raise ValueError(f"Discovery is not implemented for {manifest.get('product_code')}.")
-    if repository.connection_type == "XML_UPLOAD":
+    if repository.connection_type in {"XML_UPLOAD", "DSX_UPLOAD"}:
         content = await load_content(session, workflow.scope_payload["source_id"])
-        return InformaticaXMLParser().parse_selected_bytes(
+        parser = get_parser(
+            manifest["product_code"], manifest["method_code"]
+        )
+        return parser.parse_selected_bytes(
             content, set(selected) if selected else None,
             "INFORMATICA_XML_UPLOAD", manifest["config"]["original_file_name"],
         )
@@ -84,7 +88,7 @@ async def _upsert(session: AsyncSession, repository: RepositoryETL, mapping: Can
     canonical = mapping.model_dump(mode="json")
     row = await session.scalar(select(ETLObjectETL).where(ETLObjectETL.repository_id == repository.id, ETLObjectETL.source_object_key == mapping.source_object_key))
     if row is None:
-        row = ETLObjectETL(repository_id=repository.id, source_object_key=mapping.source_object_key, object_name=mapping.mapping_name, object_type="MAPPING", content_hash=_hash(canonical))
+        row = ETLObjectETL(repository_id=repository.id, source_object_key=mapping.source_object_key, object_name=mapping.mapping_name, object_type=mapping.source_metadata.get("object_type", "MAPPING"), content_hash=_hash(canonical))
         session.add(row)
     row.object_name = mapping.mapping_name
     row.folder_path = mapping.folder_name
@@ -252,7 +256,7 @@ async def _process(workflow_id: int) -> None:
         workflow.failure_stage = None
         workflow.failure_reason = None
         workflow.completed_at = datetime.now(timezone.utc)
-        if repository.connection_type == "XML_UPLOAD":
+        if repository.connection_type in {"XML_UPLOAD", "DSX_UPLOAD"}:
             await consume_source_content(session, workflow.scope_payload["source_id"])
         await _event(session, workflow.id, "DEPENDENCY_PLANNING_WORKFLOW_COMPLETED", "COMPLETED", "Discovery, lineage, and dependency planning completed.", 100, {"mapping_count": total}, "DEPENDENCY_PLANNING")
         await session.commit()

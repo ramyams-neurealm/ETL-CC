@@ -199,6 +199,17 @@ async def list_etl_products() -> ETLProductsResponse:
             ),
             display_order=3,
         ),
+        ETLIngestionMethodResponse(
+            method_code="DSX_UPLOAD",
+            method_name="DataStage DSX Upload",
+            description="Upload an IBM DataStage DSX export directly.",
+            enabled=settings.enable_datastage,
+            disabled_reason=(
+                None if settings.enable_datastage
+                else "This ingestion method is not enabled."
+            ),
+            display_order=4,
+        ),
     ]
 
     return ETLProductsResponse(
@@ -209,11 +220,13 @@ async def list_etl_products() -> ETLProductsResponse:
                 description="PowerCenter mappings",
                 enabled=informatica_enabled and any(
                     method.enabled for method in methods
+                    if method.method_code != "DSX_UPLOAD"
                 ),
                 disabled_reason=(
                     None
                     if informatica_enabled and any(
                         method.enabled for method in methods
+                        if method.method_code != "DSX_UPLOAD"
                     )
                     else "Informatica ingestion is not enabled."
                 ),
@@ -225,11 +238,14 @@ async def list_etl_products() -> ETLProductsResponse:
                 product_code="DATASTAGE",
                 product_name="IBM DataStage",
                 description="DataStage jobs",
-                enabled=True,
-                disabled_reason=None,
+                enabled=settings.enable_datastage,
+                disabled_reason=(
+                    None if settings.enable_datastage
+                    else "DataStage ingestion is not enabled."
+                ),
                 icon_key="datastage",
                 display_order=2,
-                ingestion_methods=[],
+                ingestion_methods=[methods[-1]],
             ),
             ETLProductResponse(
                 product_code="AB_INITIO",
@@ -350,6 +366,30 @@ async def analyze_xml(
                 "reason": str(exc),
             },
         ) from exc
+
+
+@router.post(
+    "/sources/dsx/analyze",
+    response_model=SourceAnalysisResponse,
+    tags=["Sources"],
+    summary="Analyze DataStage DSX upload",
+)
+async def analyze_dsx(
+    product_code: str = Form(...),
+    method_code: str = Form(...),
+    connection_name: str = Form(...),
+    file: UploadFile = File(...),
+    environment: str = Form("DEV"),
+    session: AsyncSession = Depends(get_session),
+):
+    return await analyze_xml(
+        product_code=product_code,
+        method_code=method_code,
+        connection_name=connection_name,
+        file=file,
+        environment=environment,
+        session=session,
+    )
 
 
 @router.post(

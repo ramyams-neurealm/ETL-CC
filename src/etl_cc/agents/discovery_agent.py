@@ -4,7 +4,7 @@ Discovery Agent for the ETL Migration Command Center.
 The agent consumes one canonical ETL mapping after connector discovery. It
 uses deterministic rules to derive technical facts, business-rule evidence,
 prerequisites, migration risks, unsupported constructs, and a migration
-complexity score. The agent does not parse Informatica XML and does not access
+complexity score. The agent does not parse source exports and does not access
 repository credentials.
 """
 

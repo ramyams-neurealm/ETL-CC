@@ -91,9 +91,14 @@ class ConversionAgent:
         "jdbc_url",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, source_vendor: str = "INFORMATICA") -> None:
+        self.source_vendor = source_vendor
         self.model_name = self.MODEL_NAME
-        self.prompt_name = self.PROMPT_NAME
+        self.prompt_name = (
+            self.PROMPT_NAME
+            if source_vendor.upper().startswith("INFORMATICA")
+            else f"{source_vendor.upper()}_TO_DATABRICKS_PYSPARK"
+        )
         self.prompt_version = self.PROMPT_VERSION
         self.input_tokens = 0
         self.output_tokens = 0
@@ -134,10 +139,10 @@ class ConversionAgent:
             },
         }
 
-        system_prompt = """
+        system_prompt = f"""
 You are the Conversion Agent for an ETL migration system.
 
-Convert exactly one supplied Informatica Canonical Mapping into
+Convert exactly one supplied {self.source_vendor} Canonical Mapping into
 validation-friendly Databricks PySpark. Use only supplied evidence. Do not
 invent fields, datasets, rules, expressions, parameters, connections, formats,
 locations, write modes, merge keys, partition columns, or runtime behavior.
