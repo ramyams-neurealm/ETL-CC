@@ -760,16 +760,33 @@ class ReferencePlanValidator:
             "source-to-target identity",
             "source to target identity",
         )
+        runtime_parameter_markers = (
+            "current date",
+            "runtime parameter",
+            "runtime parameter",
+            "load_date",
+            "current_date",
+            "parameter is resolved at runtime",
+            "resolved at runtime",
+            "parameterized date",
+        )
+
+        def _is_blocking_assumption(assumption: ReferenceAssumption) -> bool:
+            text = assumption.description.lower()
+            if assumption.assumption_type in {"MISSING_METADATA", "UNSUPPORTED_CONSTRUCT"}:
+                return True
+            if assumption.assumption_type == "RUNTIME_DEPENDENCY":
+                if any(marker in text for marker in runtime_parameter_markers):
+                    return False
+                return True
+            if aggregate_identity_is_grounded and any(
+                marker in text for marker in identity_gap_markers
+            ):
+                return False
+            return not any(marker in text for marker in runtime_parameter_markers)
+
         blocking_assumptions = [
-            assumption
-            for assumption in plan.assumptions
-            if not (
-                aggregate_identity_is_grounded
-                and any(
-                    marker in assumption.description.lower()
-                    for marker in identity_gap_markers
-                )
-            )
+            assumption for assumption in plan.assumptions if _is_blocking_assumption(assumption)
         ]
         assumption_descriptions = [
             item.description for item in blocking_assumptions
