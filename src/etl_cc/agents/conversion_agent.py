@@ -8,8 +8,15 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from etl_cc.agents.rag_retrieval_agent import RAGRetrievalResult
+from etl_cc.config import settings
+from etl_cc.agents.unit_test_renderer import UnitTestRenderer
+from etl_cc.agents.unit_test_specification import (
+    UnitTestSpecification,
+    UnitTestSpecificationValidator,
+)
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.models import CanonicalMapping
+from etl_cc.logging_config import configure_logging, metric, stage_completed, stage_started
 
 
 class GeneratedFile(BaseModel):
@@ -37,15 +44,18 @@ class ConversionOutputValidationError(RuntimeError):
     """Raised when generated artifacts violate the conversion contract."""
 
 
+logger = configure_logging("CONVERSION_AGENT")
+
+
 class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "2.4.0"
+    AGENT_VERSION = "3.0.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "INFORMATICA_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "2.4.0"
+    PROMPT_VERSION = "3.0.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
@@ -109,6 +119,7 @@ class ConversionAgent:
         critique_feedback: list[dict[str, Any]] | None = None,
     ) -> ConversionResult:
         """Generate and validate one conversion result."""
+        stage_started(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name, sources=len(mapping.sources), targets=len(mapping.targets), transformations=len(mapping.transformations))
 
         evidence = {
             "canonical_mapping": mapping.model_dump(mode="json"),
@@ -213,6 +224,9 @@ UNIT_TEST data requirements:
 - Compute expected rows by applying the complete canonical operation sequence: joins, derivations, filters, routing, aggregation, renames, and final projection.
 - Never include an expected output row that fails a canonical FILTER or ROUTE predicate. Negative and boundary inputs must be asserted as absent from output.
 - Prefer assertions keyed by deterministic target fields rather than full-row equality when runtime-generated timestamps are present.
+- Every createDataFrame(data, schema) call must use rows whose tuple/list length exactly matches the StructType field count.
+- For nondeterministic clock outputs such as SYSDATE, SYSTIMESTAMP, CURRENT_TIMESTAMP, CURRENT_DATE, NOW(), GETDATE(), or LOCALTIMESTAMP, do not add the runtime column to an expected StructType unless every expected row contains a concrete Python datetime value for that field.
+- Prefer selecting and comparing only deterministic output columns, then separately assert that each runtime-generated timestamp column exists, has TimestampType, and contains no null values.
 - For filtered mappings, include at least one accepted input and one rejected input, then assert the rejected key is absent.
 Return only the requested structured output.
 """.strip()
@@ -240,10 +254,148 @@ Return only the requested structured output.
         for generated_file in parsed.generated_files:
             generated_file.content = self._strip_fences(generated_file.content)
 
+        await self._replace_unit_test_with_rendered_specification(
+            parsed,
+            mapping,
+            evidence,
+        )
         self._normalize_configuration(parsed, mapping)
         self._capture_usage(raw)
         self._validate_result(parsed, mapping)
+        metric(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name, artifacts=len(parsed.generated_files), input_tokens=self.input_tokens, output_tokens=self.output_tokens, confidence=parsed.confidence)
+        stage_completed(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name)
         return parsed
+
+    async def _replace_unit_test_with_rendered_specification(
+        self,
+        result: ConversionResult,
+        mapping: CanonicalMapping,
+        evidence: dict[str, Any],
+    ) -> None:
+        """Generate test semantics with GPT-4o and render executable Pytest deterministically."""
+        pyspark_files = [
+            item for item in result.generated_files
+            if item.artifact_type == "PYSPARK_CODE"
+        ]
+        unit_test_files = [
+            item for item in result.generated_files
+            if item.artifact_type == "UNIT_TEST"
+        ]
+        if len(pyspark_files) != 1 or len(unit_test_files) != 1:
+            return
+
+        pyspark_file = pyspark_files[0]
+        unit_test_file = unit_test_files[0]
+        repair_errors: list[str] = []
+        max_attempts = int(
+            getattr(settings, "unit_test_specification_max_attempts", 3)
+        )
+
+        system_prompt = """
+You generate a structured, mapping-specific unit-test specification for an
+Informatica-to-PySpark conversion. Do not generate Python or Pytest code.
+Generate scenarios and typed JSON-compatible data only.
+
+Rules:
+- Use exact canonical source dataset and field names.
+- Include every canonical source dataset exactly once in every scenario.
+- input_datasets is a list. Each item has dataset_name and rows. Each row is a
+  closed object containing cells, and each cell has field_name and value.
+- expected_rows uses the same cells representation. Do not return arbitrary
+  JSON objects keyed directly by field names.
+- Use only canonical target fields in expected_rows.
+- Cover grounded happy-path and business-rule behavior. Include null,
+  boundary, negative, join, lookup, aggregation, or routing cases only when
+  applicable to this mapping.
+- comparison_keys must be stable deterministic target fields.
+- deterministic_columns must exclude outputs driven by SYSDATE,
+  SYSTIMESTAMP, CURRENT_TIMESTAMP, CURRENT_DATE, LOCALTIMESTAMP, NOW(), or
+  GETDATE().
+- Declare every such nondeterministic output in runtime_columns with its type
+  and nullability.
+- expected_rows must contain every deterministic column for every row.
+- Apply the complete canonical operation sequence when deriving expected_rows.
+- Do not invent datasets, fields, transformations, or business rules.
+- Return only the requested structured object.
+""".strip()
+
+        for attempt in range(1, max_attempts + 1):
+            request_payload = {
+                "canonical_mapping": mapping.model_dump(mode="json"),
+                "generated_pyspark": {
+                    "file_name": pyspark_file.file_name,
+                    "content": pyspark_file.content,
+                },
+                "discovery_and_rag_evidence": evidence,
+                "attempt": attempt,
+                "previous_validation_errors": repair_errors,
+            }
+            llm = DynamicChatOpenAI(
+                operation_name=(
+                    f"unit-test-specification:{mapping.source_object_key}:"
+                    f"attempt-{attempt}"
+                )
+            )
+            response = await llm.with_structured_output(
+                UnitTestSpecification,
+                include_raw=True,
+            ).ainvoke(
+                [
+                    ("system", system_prompt),
+                    ("human", json.dumps(request_payload, sort_keys=True, default=str)),
+                ]
+            )
+            specification = (
+                response.get("parsed") if isinstance(response, dict) else response
+            )
+            raw = response.get("raw") if isinstance(response, dict) else None
+            self._capture_usage(raw)
+            if specification is None:
+                repair_errors = ["No valid structured test specification was returned."]
+                continue
+
+            repair_errors = UnitTestSpecificationValidator.validate(
+                specification,
+                mapping,
+            )
+            if repair_errors:
+                continue
+
+            try:
+                rendered = UnitTestRenderer.render(
+                    specification,
+                    mapping,
+                    pyspark_file.file_name,
+                )
+            except (TypeError, ValueError, KeyError) as exc:
+                repair_errors = [
+                    f"Deterministic test rendering failed: {type(exc).__name__}: {exc}"
+                ]
+                continue
+            syntax_errors = self._validate_python_syntax(
+                GeneratedFile(
+                    artifact_type="UNIT_TEST",
+                    file_name=unit_test_file.file_name,
+                    content=rendered,
+                    media_type="text/x-python",
+                )
+            )
+            contract_errors = self._validate_unit_test_contract(
+                rendered,
+                pyspark_file.file_name,
+            )
+            repair_errors = syntax_errors + contract_errors
+            if repair_errors:
+                continue
+
+            unit_test_file.content = rendered
+            unit_test_file.media_type = "text/x-python"
+            return
+
+        raise ConversionOutputValidationError(
+            "A valid structured unit-test specification could not be generated "
+            f"after {max_attempts} attempts: " + " ".join(repair_errors)
+        )
 
     def _normalize_configuration(
         self,
@@ -488,6 +640,83 @@ Return only the requested structured output.
             and test.comparators[0].value == "__main__"
         )
 
+
+    @staticmethod
+    def _validate_create_dataframe_shapes(tree: ast.AST) -> list[str]:
+        """Detect literal row/schema width mismatches before accepting a test."""
+        assignments: dict[str, ast.AST] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is not None:
+                    assignments[node.target.id] = node.value
+
+        def resolve(node: ast.AST) -> ast.AST:
+            if isinstance(node, ast.Name):
+                return assignments.get(node.id, node)
+            return node
+
+        def schema_width(node: ast.AST) -> int | None:
+            node = resolve(node)
+            if not isinstance(node, ast.Call):
+                return None
+            function_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if function_name != "StructType" or not node.args:
+                return None
+            fields = resolve(node.args[0])
+            if isinstance(fields, (ast.List, ast.Tuple)):
+                return len(fields.elts)
+            return None
+
+        def row_widths(node: ast.AST) -> set[int] | None:
+            node = resolve(node)
+            if not isinstance(node, (ast.List, ast.Tuple)):
+                return None
+            widths: set[int] = set()
+            for row in node.elts:
+                row = resolve(row)
+                if not isinstance(row, (ast.List, ast.Tuple)):
+                    return None
+                widths.add(len(row.elts))
+            return widths
+
+        errors: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            function_name = (
+                node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else node.func.id
+                if isinstance(node.func, ast.Name)
+                else ""
+            )
+            if function_name != "createDataFrame":
+                continue
+            widths = row_widths(node.args[0])
+            width = schema_width(node.args[1])
+            if widths is None or width is None:
+                continue
+            invalid = sorted(item for item in widths if item != width)
+            if invalid:
+                errors.append(
+                    "UNIT_TEST createDataFrame row/schema mismatch: "
+                    f"StructType has {width} fields but row widths are "
+                    f"{sorted(widths)}. Ensure every row matches the schema; "
+                    "for runtime-generated timestamps, compare deterministic "
+                    "columns separately and assert timestamp type/non-nullness."
+                )
+        return errors
+
     @staticmethod
     def _validate_unit_test_contract(
         content: str,
@@ -544,6 +773,7 @@ Return only the requested structured output.
         if not test_functions:
             errors.append("UNIT_TEST must contain at least one pytest test function.")
 
+        errors.extend(ConversionAgent._validate_create_dataframe_shapes(tree))
         return errors
 
     def _validate_configuration_contract(self, content: str) -> list[str]:
@@ -627,12 +857,12 @@ Return only the requested structured output.
         usage = getattr(raw, "usage_metadata", None) or {}
         metadata = getattr(raw, "response_metadata", None) or {}
         token_usage = metadata.get("token_usage", {})
-        self.input_tokens = int(
+        self.input_tokens += int(
             usage.get("input_tokens")
             or token_usage.get("prompt_tokens")
             or 0
         )
-        self.output_tokens = int(
+        self.output_tokens += int(
             usage.get("output_tokens")
             or token_usage.get("completion_tokens")
             or 0

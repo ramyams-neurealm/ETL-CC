@@ -20,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+from pgvector.sqlalchemy import Vector
 
 from etl_cc.config import settings
 from etl_cc.database import Base
@@ -63,6 +64,78 @@ class SourceSnapshotETL(Base):
     content_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class SourceSnapshotFileETL(Base):
+    """One XML file belonging to a temporary uploaded source package."""
+
+    __tablename__ = "source_snapshot_file_etl"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_snapshot_id",
+            "file_name",
+            name="uq_source_snapshot_file_name",
+        ),
+        {"schema": ETL_SCHEMA},
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+    source_snapshot_id: Mapped[int] = mapped_column(
+        ForeignKey(
+            f"{ETL_SCHEMA}.source_snapshot_etl.id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
+    file_name: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+    )
+    content_binary: Mapped[bytes] = mapped_column(
+        LargeBinary,
+        nullable=False,
+    )
+    content_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+    )
+    content_size_bytes: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+    )
+    object_summary: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ValidationDatasetETL(Base):
+    """Validation input content stored only in PostgreSQL."""
+
+    __tablename__ = "validation_dataset_etl"
+    __table_args__ = ({"schema": ETL_SCHEMA},)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    upload_id: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    file_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    file_format: Mapped[str] = mapped_column(String(20), nullable=False)
+    content_binary: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    content_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    detected_columns: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
@@ -316,21 +389,48 @@ class ArtifactContentETL(Base):
 class KnowledgeBaseETL(Base):
     __tablename__ = "knowledge_base_etl"
     __table_args__ = ({"schema": ETL_SCHEMA},)
-
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    repository_id: Mapped[int | None] = mapped_column(
-        ForeignKey(f"{ETL_SCHEMA}.repository_etl.id", ondelete="SET NULL")
-    )
+    repository_id: Mapped[int | None] = mapped_column(ForeignKey(f"{ETL_SCHEMA}.repository_etl.id", ondelete="SET NULL"), nullable=True, index=True)
+    etl_object_id: Mapped[int | None] = mapped_column(ForeignKey(f"{ETL_SCHEMA}.etl_object_etl.id", ondelete="SET NULL"), nullable=True, index=True)
+    workflow_run_id: Mapped[int | None] = mapped_column(ForeignKey(f"{ETL_SCHEMA}.workflow_run_etl.id", ondelete="SET NULL"), nullable=True)
     knowledge_type: Mapped[str] = mapped_column(String(80), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     metadata_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.rag_embedding_dimensions), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    embedding_status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    embedding_content_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    embedding_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approval_status: Mapped[str] = mapped_column(String(30), nullable=False, default="PENDING")
+    confidence_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_agent: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    source_user: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
-    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class RAGRetrievalEventETL(Base):
+    __tablename__ = "rag_retrieval_event_etl"
+    __table_args__ = ({"schema": ETL_SCHEMA},)
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    workflow_run_id: Mapped[int | None] = mapped_column(ForeignKey(f"{ETL_SCHEMA}.workflow_run_etl.id", ondelete="SET NULL"))
+    repository_id: Mapped[int | None] = mapped_column(ForeignKey(f"{ETL_SCHEMA}.repository_etl.id", ondelete="SET NULL"), index=True)
+    etl_object_id: Mapped[int | None] = mapped_column(ForeignKey(f"{ETL_SCHEMA}.etl_object_etl.id", ondelete="SET NULL"), index=True)
+    query_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(100), nullable=False)
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retrieved_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    accepted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    top_similarity: Mapped[float | None] = mapped_column(nullable=True)
+    average_similarity: Mapped[float | None] = mapped_column(nullable=True)
+    retrieval_duration_ms: Mapped[float] = mapped_column(nullable=False, default=0.0)
+    context_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    contributed_to_prompt: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    calculation_basis: Mapped[str] = mapped_column(String(40), nullable=False, default="BASELINE_NOT_CONFIGURED")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ValidationTestCaseETL(Base):

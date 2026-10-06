@@ -346,22 +346,19 @@ async def analyze_xml(
     product_code: str = Form(...),
     method_code: str = Form(...),
     connection_name: str = Form(...),
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] | None = File(default=None),
     environment: str = Form("DEV"),
     session: AsyncSession = Depends(get_session),
 ):
     try:
         if environment not in {"DEV", "STAGING", "PROD"}:
             raise ValueError("Environment must be DEV, STAGING, or PROD.")
-        return await analyze_xml_upload(
-            session,
-            product_code,
-            method_code,
-            connection_name,
-            environment,
-            file.filename or "upload.xml",
-            await file.read(),
-        )
+        uploads=[]
+        if file is not None: uploads.append((file.filename or "upload.xml", await file.read()))
+        for item in files or []: uploads.append((item.filename or "upload.xml", await item.read()))
+        if not uploads: raise ValueError("At least one XML or ZIP file is required.")
+        return await analyze_xml_upload(session,product_code,method_code,connection_name,environment,uploaded_files=uploads)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -988,10 +985,13 @@ async def artifact_content(
 
 
 @router.post("/validations/datasets", response_model=ValidationDatasetUploadResponse, tags=["Zero-Touch Validation"])
-async def upload_validation_dataset(file: UploadFile = File(...)):
+async def upload_validation_dataset(
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
     from etl_cc.validation_store import validation_store
     try:
-        return validation_store.stage(file.filename or "dataset", await file.read())
+        return await validation_store.stage(session, file.filename or "dataset", await file.read())
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1139,23 +1139,11 @@ async def data_comparison(
 
     try:
         tolerance = Decimal(numeric_tolerance)
-        legacy_path = validation_store.save(
-            workflow_id,
-            "legacy",
-            legacy_output.filename or "legacy.csv",
-            await legacy_output.read(),
-        )
-        pyspark_path = validation_store.save(
-            workflow_id,
-            "pyspark",
-            pyspark_output.filename or "pyspark.csv",
-            await pyspark_output.read(),
-        )
-        return MatchFlowComparator().compare(
-            legacy_path,
-            pyspark_path,
-            keys,
-            tolerance,
+        legacy_rows = validation_store.parse(legacy_output.filename or "legacy.csv", await legacy_output.read())
+        pyspark_rows = validation_store.parse(pyspark_output.filename or "pyspark.csv", await pyspark_output.read())
+        return MatchFlowComparator().compare_rows(
+            legacy_rows=legacy_rows, pyspark_rows=pyspark_rows,
+            keys=keys, tolerance=tolerance,
         )
     except (ValueError, InvalidOperation) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
