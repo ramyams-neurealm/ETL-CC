@@ -1,78 +1,74 @@
 {
   "format": "AB_INITIO_GRAPH_JSON",
   "format_version": "1.0",
-  "project": "transactions",
+  "project": "accounts",
   "graphs": [
     {
-      "name": "g_process_high_value_txns",
-      "version": "synthetic-v2",
+      "name": "g_load_active_accounts",
+      "version": "synthetic-v1",
       "parameters": [
         {
-          "name": "THRESHOLD_AMT",
-          "parameter_type": "DECIMAL",
-          "data_type": "DECIMAL",
-          "default_value": "1000.00",
+          "name": "LOAD_DATE",
+          "parameter_type": "DATE",
+          "data_type": "DATE",
+          "default_value": "CURRENT_DATE",
           "scope": "GRAPH"
         }
       ],
       "datasets": {
         "sources": [
           {
-            "name": "SRC_TRANSACTION",
-            "connection_name": "synthetic_txns",
+            "name": "SRC_ACCOUNT",
+            "connection_name": "synthetic_accounts",
             "fields": [
-              {"name": "TXN_ID", "data_type": "STRING", "nullable": false},
               {"name": "ACCOUNT_ID", "data_type": "INTEGER", "nullable": false},
-              {"name": "TXN_AMOUNT", "data_type": "DECIMAL", "precision": 10, "scale": 2, "nullable": false}
+              {"name": "ACCOUNT_STATUS", "data_type": "STRING", "nullable": false},
+              {"name": "ACCOUNT_BALANCE", "data_type": "DECIMAL", "precision": 12, "scale": 2, "nullable": true}
             ]
           }
         ],
         "targets": [
           {
-            "name": "TGT_HIGH_VALUE",
+            "name": "TGT_ACTIVE_ACCOUNT",
             "connection_name": "synthetic_target",
             "fields": [
-              {"name": "TXN_ID", "data_type": "STRING", "nullable": false},
               {"name": "ACCOUNT_ID", "data_type": "INTEGER", "nullable": false},
-              {"name": "TXN_AMOUNT", "data_type": "DECIMAL", "precision": 10, "scale": 2, "nullable": false},
-              {"name": "FLAG", "data_type": "STRING", "nullable": false}
+              {"name": "ACCOUNT_BALANCE", "data_type": "DECIMAL", "precision": 12, "scale": 2, "nullable": true},
+              {"name": "LOAD_DATE", "data_type": "DATE", "nullable": false}
             ]
           }
         ]
       },
       "components": [
         {
-          "name": "FILTER_HIGH_VALUE",
+          "name": "FILTER_ACTIVE",
           "type": "FILTER",
-          "properties": {"condition": "TXN_AMOUNT > $THRESHOLD_AMT"}
+          "properties": {"condition": "ACCOUNT_STATUS == \\\"ACTIVE\\\""}
         },
         {
-          "name": "REFORMAT_TXN",
+          "name": "REFORMAT_ACCOUNT",
           "type": "REFORMAT",
           "ports": [
-            {"name": "TXN_ID", "direction": "OUTPUT", "expression": "TXN_ID"},
             {"name": "ACCOUNT_ID", "direction": "OUTPUT", "expression": "ACCOUNT_ID"},
-            {"name": "TXN_AMOUNT", "direction": "OUTPUT", "expression": "TXN_AMOUNT"},
-            {"name": "FLAG", "direction": "OUTPUT", "expression": "\"HIGH_VALUE\""}
+            {"name": "ACCOUNT_BALANCE", "direction": "OUTPUT", "expression": "ACCOUNT_BALANCE"},
+            {"name": "LOAD_DATE", "direction": "OUTPUT", "expression": "$LOAD_DATE"}
           ]
         }
       ],
       "edges": [
-        {"from_instance": "SRC_TRANSACTION", "to_instance": "FILTER_HIGH_VALUE"},
-        {"from_instance": "FILTER_HIGH_VALUE", "to_instance": "REFORMAT_TXN"},
-        {"from_instance": "REFORMAT_TXN", "to_instance": "TGT_HIGH_VALUE"}
+        {"from_instance": "SRC_ACCOUNT", "to_instance": "FILTER_ACTIVE"},
+        {"from_instance": "FILTER_ACTIVE", "to_instance": "REFORMAT_ACCOUNT"},
+        {"from_instance": "REFORMAT_ACCOUNT", "to_instance": "TGT_ACTIVE_ACCOUNT"}
       ],
       "field_links": [
-        {"from_instance": "SRC_TRANSACTION", "from_field": "TXN_ID", "to_instance": "FILTER_HIGH_VALUE", "to_field": "TXN_ID"},
-        {"from_instance": "SRC_TRANSACTION", "from_field": "ACCOUNT_ID", "to_instance": "FILTER_HIGH_VALUE", "to_field": "ACCOUNT_ID"},
-        {"from_instance": "SRC_TRANSACTION", "from_field": "TXN_AMOUNT", "to_instance": "FILTER_HIGH_VALUE", "to_field": "TXN_AMOUNT"},
-        {"from_instance": "FILTER_HIGH_VALUE", "from_field": "TXN_ID", "to_instance": "REFORMAT_TXN", "to_field": "TXN_ID"},
-        {"from_instance": "FILTER_HIGH_VALUE", "from_field": "ACCOUNT_ID", "to_instance": "REFORMAT_TXN", "to_field": "ACCOUNT_ID"},
-        {"from_instance": "FILTER_HIGH_VALUE", "from_field": "TXN_AMOUNT", "to_instance": "REFORMAT_TXN", "to_field": "TXN_AMOUNT"},
-        {"from_instance": "REFORMAT_TXN", "from_field": "TXN_ID", "to_instance": "TGT_HIGH_VALUE", "to_field": "TXN_ID"},
-        {"from_instance": "REFORMAT_TXN", "from_field": "ACCOUNT_ID", "to_instance": "TGT_HIGH_VALUE", "to_field": "ACCOUNT_ID"},
-        {"from_instance": "REFORMAT_TXN", "from_field": "TXN_AMOUNT", "to_instance": "TGT_HIGH_VALUE", "to_field": "TXN_AMOUNT"},
-        {"from_instance": "REFORMAT_TXN", "from_field": "FLAG", "to_instance": "TGT_HIGH_VALUE", "to_field": "FLAG"}
+        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_ID", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_ID"},
+        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_STATUS", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_STATUS"},
+        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_BALANCE", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_BALANCE"},
+        {"from_instance": "FILTER_ACTIVE", "from_field": "ACCOUNT_ID", "to_instance": "REFORMAT_ACCOUNT", "to_field": "ACCOUNT_ID"},
+        {"from_instance": "FILTER_ACTIVE", "from_field": "ACCOUNT_BALANCE", "to_instance": "REFORMAT_ACCOUNT", "to_field": "ACCOUNT_BALANCE"},
+        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "ACCOUNT_ID", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "ACCOUNT_ID"},
+        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "ACCOUNT_BALANCE", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "ACCOUNT_BALANCE"},
+        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "LOAD_DATE", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "LOAD_DATE"}
       ]
     }
   ]

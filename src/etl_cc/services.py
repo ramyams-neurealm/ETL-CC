@@ -865,23 +865,21 @@ async def start_migration(
         StartConversionRequest(
             repository_id=request.repository_id,
             etl_object_ids=request.etl_object_ids,
+            migration_id=migration_id,
             target_platform=request.target_platform,
             target_framework=request.target_framework,
             follow_migration_waves=request.follow_migration_waves,
         ),
+        commit=False,
     )
-    conversion = await get_workflow_by_external_id(
-        session, conversion_response.workflow_id
-    )
-    conversion.batch_id = migration_id
     parent.scope_payload = {
         **parent.scope_payload,
-        "conversion_workflow_id": conversion.workflow_id,
+        "conversion_workflow_id": conversion_response.workflow_id,
     }
     await session.commit()
     return StartMigrationResponse(
         migration_id=migration_id,
-        conversion_workflow_id=conversion.workflow_id,
+        conversion_workflow_id=conversion_response.workflow_id,
         repository_id=request.repository_id,
         status="QUEUED",
         mapping_count=len(set(request.etl_object_ids)),
@@ -1307,6 +1305,8 @@ async def get_migration_lineage(session: AsyncSession, migration_id: str, etl_ob
 async def start_conversion(
     session: AsyncSession,
     request: StartConversionRequest,
+    *,
+    commit: bool = True,
 ) -> StartConversionResponse:
     repository = await session.get(RepositoryETL, request.repository_id)
     if repository is None:
@@ -1322,6 +1322,22 @@ async def start_conversion(
         raise ValueError(
             "One or more selected mappings do not belong to the repository."
         )
+    parent = None
+    if request.migration_id:
+        parent = await get_workflow_by_external_id(session, request.migration_id)
+        if (
+            parent is None
+            or parent.job_type != "MIGRATION"
+            or parent.repository_id != request.repository_id
+        ):
+            raise ValueError("Migration not found for this repository.")
+        migration_mapping_ids = set(
+            parent.scope_payload.get("etl_object_ids", [])
+        )
+        if not set(selected_ids).issubset(migration_mapping_ids):
+            raise ValueError(
+                "One or more selected mappings are not part of the Migration."
+            )
     not_ready = [
         row.object_name
         for row in rows
@@ -1336,6 +1352,7 @@ async def start_conversion(
         )
     workflow = WorkflowRunETL(
         workflow_id=f"CONV-{uuid4()}",
+        batch_id=parent.workflow_id if parent else None,
         repository_id=request.repository_id,
         current_stage="CONVERSION",
         overall_status="QUEUED",
@@ -1366,7 +1383,8 @@ async def start_conversion(
     ))
     for row in rows:
         row.migration_status = "QUEUED"
-    await session.commit()
+    if commit:
+        await session.commit()
     return StartConversionResponse(
         workflow_id=workflow.workflow_id,
         repository_id=workflow.repository_id,

@@ -678,6 +678,7 @@ class StartMigrationResponse(BaseModel):
 class StartConversionRequest(BaseModel):
     repository_id: int
     etl_object_ids: list[int] = Field(min_length=1)
+    migration_id: str | None = None
     target_platform: Literal["DATABRICKS"] = "DATABRICKS"
     target_framework: Literal["PYSPARK"] = "PYSPARK"
     follow_migration_waves: bool = True

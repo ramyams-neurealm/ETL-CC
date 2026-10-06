@@ -610,6 +610,12 @@ class ReferencePlanValidator:
             issues.append(ReferencePlanIssue(code="EMPTY_PLAN", message="Reference plan has no operations."))
 
         available = dict(datasets)
+        runtime_dependency_fields = {
+            field
+            for assumption in plan.assumptions
+            if assumption.assumption_type == "RUNTIME_DEPENDENCY"
+            for field in (assumption.affected_fields or [])
+        }
         operation_ids: set[str] = set()
         for operation_item in plan.operations:
             operation_id = operation_item.operation_id
@@ -643,7 +649,7 @@ class ReferencePlanValidator:
                     if expression.expression.strip().upper() != expression.output_field.upper():
                         derived_fields.add(expression.output_field)
             elif kind == "PROJECT":
-                unknown = set(operation_item.columns) - fields
+                unknown = set(operation_item.columns) - fields - runtime_dependency_fields
                 if unknown:
                     issues.append(ReferencePlanIssue(code="UNKNOWN_COLUMNS", message=f"Unknown projected columns: {sorted(unknown)}", operation_id=operation_id))
                 output_fields = set(operation_item.columns)
