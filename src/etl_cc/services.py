@@ -67,7 +67,8 @@ from etl_cc.security import (
     credential_cipher,
     verify_connection_test_token,
 )
-from etl_cc.source_store import create_source, load_manifest, update_manifest
+from etl_cc.source_store import create_source, create_source_package, load_manifest, update_manifest
+from etl_cc.xml_package import expand_uploads, merge_xml_files, object_summary
 
 
 SUPPORTED_SOURCE_SELECTIONS = {
@@ -157,36 +158,24 @@ async def analyze_github(session: AsyncSession, request: GitHubConnectionRequest
     return response
 
 
-async def analyze_xml_upload(
-    session: AsyncSession,
-    product_code: str,
-    method_code: str,
-    connection_name: str,
-    environment: str,
-    file_name: str,
-    content: bytes,
-) -> SourceAnalysisResponse:
+async def analyze_xml_upload(session, product_code, method_code, connection_name, environment, file_name=None, content=None, uploaded_files=None):
     _validate_source_selection(product_code, method_code, "XML_UPLOAD")
-    if not file_name.lower().endswith(".xml"):
-        raise ValueError("Only .xml files are accepted.")
-    if not content:
-        raise ValueError("The uploaded XML file is empty.")
-    parser = InformaticaXMLParser()
-    mappings = parser.list_mappings_bytes(content, Path(file_name).name)
-    source_id, digest = await create_source(session, "XML_UPLOAD", {}, content)
-    payload = {
-        "connection_name": connection_name, "environment": environment,
-        "file_name": Path(file_name).name, "content_hash": digest,
-    }
-    response, fingerprint = _response(product_code, method_code, source_id, payload, mappings, "Informatica XML validated and mappings loaded.")
-    await update_manifest(session, source_id, {
-        "fingerprint": fingerprint, "product_code": product_code, "method_code": method_code, "connection_type": method_code,
-        "connection_name": connection_name, "environment": environment,
-        "config": {"original_file_name": Path(file_name).name, "content_hash": digest, "file_size": len(content)},
-        "credential_ciphertext": None,
-    })
-    await session.commit()
-    return response
+    uploads=list(uploaded_files or [])
+    if file_name is not None or content is not None:
+        if file_name is None or content is None: raise ValueError("file_name and content are both required.")
+        uploads.insert(0,(file_name,content))
+    xml_files=expand_uploads(uploads,allow_zip=settings.xml_package_allow_zip,max_files=settings.xml_package_max_files,max_file_bytes=settings.xml_package_max_file_bytes,max_total_bytes=settings.xml_package_max_total_bytes)
+    merged=merge_xml_files(xml_files); parser=InformaticaXMLParser(); mappings=parser.list_mappings_bytes(merged,"XML_PACKAGE")
+    stored=[]; summaries=[]; totals={"mappings":0,"sessions":0,"workflows":0,"worklets":0}
+    for name,data in xml_files:
+        summary=object_summary(data)
+        for key in totals: totals[key]+=summary[key]
+        stored.append((name,data,summary)); summaries.append({"file_name":name,"content_hash":hashlib.sha256(data).hexdigest(),"content_size_bytes":len(data),"object_summary":summary})
+    source_id,digest=await create_source_package(session,"XML_UPLOAD",{},stored)
+    payload={"connection_name":connection_name,"environment":environment,"file_name":summaries[0]["file_name"] if len(summaries)==1 else "XML_PACKAGE","content_hash":digest,"file_count":len(summaries),"object_summary":totals}
+    response,fingerprint=_response(product_code,method_code,source_id,payload,mappings,"Informatica XML package validated and mappings loaded.")
+    await update_manifest(session,source_id,{"fingerprint":fingerprint,"product_code":product_code,"method_code":method_code,"connection_type":method_code,"connection_name":connection_name,"environment":environment,"config":{"original_file_name":payload["file_name"],"package_hash":digest,"file_count":len(summaries),"total_size_bytes":sum(x["content_size_bytes"] for x in summaries),"files":summaries,"object_summary":totals},"credential_ciphertext":None})
+    await session.commit(); return response
 
 
 async def start_discovery(
@@ -1005,15 +994,6 @@ async def get_migration_token_utilization(
     }
 
 
-def _public_validation_files(data_files: dict[str, Any] | None) -> dict[str, str]:
-    """Return safe filenames without exposing internal absolute server paths."""
-    return {
-        str(name): Path(str(path)).name
-        for name, path in (data_files or {}).items()
-        if path
-    }
-
-
 async def get_migration_dashboard(
     session: AsyncSession,
     migration_id: str,
@@ -1154,10 +1134,6 @@ async def get_migration_dashboard(
             "evidence": {
                 "test_cases": validation_payload.get("test_cases", []),
                 "stages": validation_payload.get("stages", []),
-                "data_files": _public_validation_files(
-                    validation_payload.get("data_files")
-                    or completion_payload.get("data_files")
-                ),
             },
             "event_log": mapping_events,
             "links": {

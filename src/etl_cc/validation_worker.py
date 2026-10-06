@@ -452,7 +452,7 @@ async def _process(workflow_id: int) -> None:
             requested_row_count = int((workflow.scope_payload.get("simulation_options") or {}).get("target_row_count", settings.validation_simulation_default_rows))
             if input_mode == "DATASET_FILE":
                 for item in workflow.scope_payload.get("dataset_files", []):
-                    input_datasets[item["dataset_name"]] = validation_store.load_upload(item["upload_id"])
+                    input_datasets[item["dataset_name"]] = await validation_store.load_upload(session, item["upload_id"])
             elif input_mode == "DATABASE_TABLES":
                 specification = workflow.scope_payload.get("database_tables") or {}
                 for item in specification.get("source_tables", []):
@@ -558,7 +558,6 @@ async def _process(workflow_id: int) -> None:
                     "confidence_index": result.confidence_index,
                     "failure_reason": result.failure_reason,
                     "recommendation": result.recommendation,
-                    "data_files": result.data_files,
                 },
             )
             await session.commit()

@@ -386,6 +386,64 @@ class SafeExpression:
         ast.IsNot: operator.is_not,
     }
 
+    @staticmethod
+    def _split_sql_case(text: str) -> str:
+        """Translate searched SQL CASE expressions into nested if_else calls.
+
+        Handles multiple WHEN branches and nested CASE blocks without eval.
+        Expressions that cannot be parsed safely are returned unchanged so the
+        normal validator reports a precise syntax issue.
+        """
+        case_re = re.compile(r"\bCASE\b", re.IGNORECASE)
+        while case_re.search(text):
+            starts = [match.start() for match in case_re.finditer(text)]
+            replaced = False
+            for start in reversed(starts):
+                depth = 0
+                end = None
+                token_re = re.compile(r"\b(CASE|END)\b", re.IGNORECASE)
+                for token in token_re.finditer(text, start):
+                    word = token.group(1).upper()
+                    depth += 1 if word == "CASE" else -1
+                    if depth == 0:
+                        end = token.end()
+                        break
+                if end is None:
+                    continue
+                body = text[start + 4:end - 3].strip()
+                parts = re.split(r"\b(WHEN|THEN|ELSE)\b", body, flags=re.IGNORECASE)
+                branches = []
+                fallback = "None"
+                index = 1
+                try:
+                    while index < len(parts):
+                        token = parts[index].upper()
+                        if token == "WHEN":
+                            condition = parts[index + 1].strip()
+                            if parts[index + 2].upper() != "THEN":
+                                raise ValueError
+                            value = parts[index + 3].strip()
+                            branches.append((condition, value))
+                            index += 4
+                        elif token == "ELSE":
+                            fallback = parts[index + 1].strip()
+                            index += 2
+                        else:
+                            index += 1
+                    if not branches:
+                        continue
+                except (IndexError, ValueError):
+                    continue
+                rendered = fallback
+                for condition, value in reversed(branches):
+                    rendered = f"if_else({condition}, {value}, {rendered})"
+                text = text[:start] + rendered + text[end:]
+                replaced = True
+                break
+            if not replaced:
+                break
+        return text
+
     @classmethod
     def normalize(cls, expression: str) -> str:
         """Normalize a constrained subset of PowerCenter/SQL expressions."""
@@ -395,13 +453,7 @@ class SafeExpression:
             if decoded == text:
                 break
             text = decoded
-        case_pattern = re.compile(
-            r"^CASE\s+WHEN\s+(.+?)\s+THEN\s+(.+?)\s+ELSE\s+(.+?)\s+END$",
-            flags=re.I | re.S,
-        )
-        match = case_pattern.match(text)
-        if match:
-            text = f"if_else({match.group(1)}, {match.group(2)}, {match.group(3)})"
+        text = cls._split_sql_case(text)
         text = re.sub(r"\bSYSDATE\b", "validation_now()", text, flags=re.I)
         text = re.sub(
             r"\bNOT\s+IN\s*\(([^()]*)\)",
@@ -1189,6 +1241,7 @@ class ValidationContext(BaseModel):
     input_datasets: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     expected_output_rows: list[dict[str, Any]] | None = None
     requested_row_count: int = 1000
+    numeric_tolerance: Decimal = Field(default=Decimal("0"), ge=0)
 
 
 class ValidationTestResult(BaseModel):
@@ -2095,25 +2148,70 @@ def calculate_confidence(match_percentage: float, scenario_coverage: float, busi
     return round(max(0.0, min(score - min(assumptions * 0.03, 0.15), 1.0)), 4)
 
 
-class ValidationDataStore:
-    @property
-    def root(self) -> Path:
-        path = settings.project_root / getattr(settings, "validation_data_directory_name", "runtime_validation_data")
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def write(self, workflow_id: str, mapping_name: str, name: str, payload: Any) -> Path:
-        safe = lambda value: "".join(character if character.isalnum() or character in "-_." else "_" for character in value)
-        directory = self.root / safe(workflow_id) / safe(mapping_name)
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / safe(name)
-        path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-        return path
-
-
 class ValidationAgent:
+    _NONDETERMINISTIC_CLOCK_PATTERN = re.compile(
+        r"(?<![A-Za-z0-9_])(?:"
+        r"SYSDATE|SYSTIMESTAMP|CURRENT_TIMESTAMP|CURRENT_DATE|"
+        r"LOCALTIMESTAMP|NOW\s*\(|GETDATE\s*\("
+        r")(?![A-Za-z0-9_])",
+        flags=re.IGNORECASE,
+    )
+
+    @classmethod
+    def _runtime_generated_columns(
+        cls,
+        mapping: CanonicalMapping,
+    ) -> set[str]:
+        """Find output ports explicitly driven by runtime clock expressions."""
+        columns: set[str] = set()
+        for transformation in mapping.transformations:
+            for port in transformation.ports:
+                expression = str(port.expression or "").strip()
+                direction = str(port.direction or "").strip().upper()
+                if not expression:
+                    continue
+                if direction not in {"OUTPUT", "OUT", "OUTPUT/INPUT", "INOUT"}:
+                    continue
+                if cls._NONDETERMINISTIC_CLOCK_PATTERN.search(expression):
+                    columns.add(str(port.name))
+        return columns
+
+    @staticmethod
+    def _runtime_column_issues(
+        rows: list[dict[str, Any]],
+        runtime_columns: set[str],
+    ) -> list[str]:
+        """Require excluded runtime columns to exist and remain non-null."""
+        if not rows or not runtime_columns:
+            return []
+        actual_names = {
+            str(column).casefold(): str(column)
+            for row in rows
+            for column in row
+        }
+        issues: list[str] = []
+        for configured_name in sorted(runtime_columns):
+            actual_name = actual_names.get(configured_name.casefold())
+            if actual_name is None:
+                issues.append(
+                    f"Runtime-generated column {configured_name} is missing "
+                    "from target output."
+                )
+                continue
+            null_count = sum(
+                1
+                for row in rows
+                if actual_name not in row or row.get(actual_name) is None
+            )
+            if null_count:
+                issues.append(
+                    f"Runtime-generated column {configured_name} contains "
+                    f"{null_count} null value(s)."
+                )
+        return issues
+
     AGENT_NAME = "VALIDATION_AGENT"
-    AGENT_VERSION = "4.8.0"
+    AGENT_VERSION = "4.9.0"
     STAGE_NAME = "ZERO_TOUCH_VALIDATION"
     MODEL_NAME = "HYBRID_GPT4O_DETERMINISTIC"
 
@@ -2465,6 +2563,86 @@ class ValidationAgent:
         return expanded
 
     @staticmethod
+    def _replace_expression_fields(expression: str | None, aliases: dict[str, str]) -> str | None:
+        if not expression:
+            return expression
+        result = expression
+        for alias, source in sorted(aliases.items(), key=lambda item: -len(item[0])):
+            result = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(alias)}(?![A-Za-z0-9_])",
+                source,
+                result,
+            )
+        return result
+
+    @classmethod
+    def _normalize_reference_connector_aliases(
+        cls,
+        mapping: CanonicalMapping,
+        plan: ReferencePlan,
+    ) -> ReferencePlan:
+        """Repair connector-grounded aliases missing from LLM relational IR.
+
+        JOIN execution currently merges source rows using their source field
+        names. Informatica connector target-port aliases therefore need to be
+        translated back to the uniquely grounded upstream fields before plan
+        validation and execution. Ambiguous aliases are deliberately left
+        unchanged so deterministic validation blocks unsafe guessing.
+        """
+        transformation_names = {item.name for item in mapping.transformations}
+        aliases_by_instance: dict[str, dict[str, str]] = {}
+        for instance in transformation_names:
+            candidates: dict[str, set[str]] = defaultdict(set)
+            for connector in mapping.connectors:
+                if (
+                    connector.to_instance == instance
+                    and connector.to_field
+                    and connector.from_field
+                    and connector.to_field != connector.from_field
+                ):
+                    candidates[connector.to_field].add(connector.from_field)
+            aliases_by_instance[instance] = {
+                alias: next(iter(sources))
+                for alias, sources in candidates.items()
+                if len(sources) == 1
+            }
+
+        propagated: dict[str, dict[str, str]] = {}
+        for operation in plan.operations:
+            aliases = dict(propagated.get(operation.input_name, {}))
+            aliases.update(aliases_by_instance.get(operation.input_name, {}))
+            if operation.operation == "JOIN":
+                aliases.update(aliases_by_instance.get(operation.output_name, {}))
+
+            operation.condition = cls._replace_expression_fields(
+                operation.condition,
+                aliases,
+            )
+            for expression in operation.expressions:
+                expression.expression = cls._replace_expression_fields(
+                    expression.expression,
+                    aliases,
+                ) or expression.expression
+            operation.columns = [aliases.get(item, item) for item in operation.columns]
+            operation.group_by = [aliases.get(item, item) for item in operation.group_by]
+            operation.left_keys = [aliases.get(item, item) for item in operation.left_keys]
+            operation.right_keys = [aliases.get(item, item) for item in operation.right_keys]
+            operation.deduplicate_keys = [aliases.get(item, item) for item in operation.deduplicate_keys]
+            for aggregate in operation.aggregates:
+                if aggregate.input_field:
+                    aggregate.input_field = aliases.get(
+                        aggregate.input_field,
+                        aggregate.input_field,
+                    )
+            for sort_field in operation.sort_fields:
+                sort_field.field_name = aliases.get(
+                    sort_field.field_name,
+                    sort_field.field_name,
+                )
+            propagated[operation.output_name] = aliases
+        return plan
+
+    @staticmethod
     def _normalize_reference_target_renames(mapping: CanonicalMapping, plan: ReferencePlan) -> ReferencePlan:
         """Apply connector-grounded terminal renames once, before projection."""
         targets = {item.name for item in mapping.targets}
@@ -2543,6 +2721,9 @@ class ValidationAgent:
         artifacts = self._artifacts(context.artifact_paths)
         stages: list[ValidationStageResult] = []
         tests: list[ValidationTestResult] = []
+        # Validation evidence remains in memory and is persisted through the
+        # existing PostgreSQL audit/test-case flow. No project-level runtime
+        # data directory is created.
         files: dict[str, str] = {}
 
         plan_agent = TestPlanAgent()
@@ -2620,14 +2801,9 @@ class ValidationAgent:
         stages.append(self._stage(validator, "COMPLETED", synthetic_validation.model_dump(mode="json")))
         metric(logger, "SYNTHETIC_DATA_VALIDATION", mapping=mapping.mapping_name, status=synthetic_validation.status, valid_rows=synthetic_validation.valid_row_count, schema_coverage=synthetic_validation.schema_coverage, scenario_coverage=synthetic_validation.scenario_coverage)
         tests.extend(self._synthetic_tests(synthetic, synthetic_validation))
-        store = ValidationDataStore()
-        input_path = store.write(
-            context.workflow_id,
-            mapping.mapping_name,
-            "synthetic_input.json",
-            prepared_input_datasets or input_rows,
-        )
-        files["synthetic_input"] = str(input_path)
+        # Do not materialize synthetic input under the project directory.
+        # The rows are consumed in memory below, while stage and test evidence
+        # is persisted by validation_worker.py to PostgreSQL.
 
         # Generate an independent reference plan from canonical evidence only.
         # Generated PySpark code is intentionally not provided to this agent.
@@ -2636,6 +2812,10 @@ class ValidationAgent:
             mapping,
             context.discovery,
             context.lineage,
+        )
+        reference_plan = self._normalize_reference_connector_aliases(
+            mapping,
+            reference_plan,
         )
         reference_plan = self._normalize_reference_target_renames(
             mapping,
@@ -2716,38 +2896,76 @@ class ValidationAgent:
                 reference.error_message,
             )
         )
-        reference_path = None
-        if reference.status == "PASSED":
-            reference_path = store.write(
-                context.workflow_id,
-                mapping.mapping_name,
-                "reference_output.json",
-                reference.rows,
-            )
-            files["reference_output"] = str(reference_path)
-
         target_agent = TargetPySparkExecutor()
-        target = target_agent.run(artifacts["PYSPARK_CODE"], mapping, input_datasets, settings.validation_test_timeout_seconds) if synthetic_validation.status == "PASSED" and static.safe_to_execute_tests else TargetExecutionResult(status="SKIPPED", error_message="Synthetic or static validation blocked target execution.")
-        stages.append(self._stage(target_agent, "COMPLETED" if target.status == "PASSED" else target.status, target.model_dump(mode="json"), target.error_message))
-        metric(logger, "TARGET_EXECUTION", mapping=mapping.mapping_name, status=target.status, rows=target.row_count)
-        target_path = None
-        if target.status == "PASSED":
-            target_path = store.write(context.workflow_id, mapping.mapping_name, "target_output.json", target.rows)
-            files["target_output"] = str(target_path)
+        target = (
+            target_agent.run(
+                artifacts["PYSPARK_CODE"],
+                mapping,
+                input_datasets,
+                settings.validation_test_timeout_seconds,
+            )
+            if synthetic_validation.status == "PASSED" and static.safe_to_execute_tests
+            else TargetExecutionResult(
+                status="SKIPPED",
+                error_message="Synthetic or static validation blocked target execution.",
+            )
+        )
+        stages.append(
+            self._stage(
+                target_agent,
+                "COMPLETED" if target.status == "PASSED" else target.status,
+                target.model_dump(mode="json"),
+                target.error_message,
+            )
+        )
+        metric(
+            logger,
+            "TARGET_EXECUTION",
+            mapping=mapping.mapping_name,
+            status=target.status,
+            rows=target.row_count,
+        )
 
         match: MatchFlowResult | None = None
         comparator = MatchFlowComparator()
-        if context.expected_output_rows is not None:
-            target_path = store.write(context.workflow_id, mapping.mapping_name, "selected_target_output.json", context.expected_output_rows)
-            files["selected_target_output"] = str(target_path)
-        if reference_path and target_path:
-            match = comparator.compare(
-                reference_path,
-                target_path,
-                reference_plan.comparison_keys,
+        comparison_target_rows = (
+            context.expected_output_rows
+            if context.expected_output_rows is not None
+            else (target.rows if target.status == "PASSED" else [])
+        )
+        if reference.status == "PASSED" and comparison_target_rows:
+            runtime_generated_columns = self._runtime_generated_columns(mapping)
+            runtime_column_issues = self._runtime_column_issues(
+                comparison_target_rows,
+                runtime_generated_columns,
             )
-            stages.append(self._stage(comparator, "COMPLETED", match.model_dump(mode="json")))
-            metric(logger, "MATCHFLOW", mapping=mapping.mapping_name, match_percentage=match.match_percentage, rows_compared=match.rows_compared, missing=match.missing_rows, additional=match.additional_rows, different=match.different_rows)
+            if runtime_column_issues:
+                raise ValueError("; ".join(runtime_column_issues))
+
+            match = comparator.compare_rows(
+                legacy_rows=reference.rows,
+                pyspark_rows=comparison_target_rows,
+                keys=reference_plan.comparison_keys,
+                tolerance=context.numeric_tolerance,
+                ignored_columns=runtime_generated_columns,
+            )
+            match_payload = match.model_dump(mode="json")
+            match_payload["ignored_runtime_columns"] = sorted(
+                runtime_generated_columns
+            )
+            stages.append(
+                self._stage(comparator, "COMPLETED", match_payload)
+            )
+            metric(
+                logger,
+                "MATCHFLOW",
+                mapping=mapping.mapping_name,
+                match_percentage=match.match_percentage,
+                rows_compared=match.rows_compared,
+                missing=match.missing_rows,
+                additional=match.additional_rows,
+                different=match.different_rows,
+            )
         else:
             stages.append(
                 self._stage(

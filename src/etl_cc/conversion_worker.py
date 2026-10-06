@@ -334,7 +334,13 @@ async def _process_mapping(
         {"mapping": mapping.mapping_name},
     )
     try:
-        rag = await rag_agent.run(session, mapping, repository.id)
+        rag = await rag_agent.run(
+            session,
+            mapping,
+            repository.id,
+            workflow_run_id=workflow.id,
+            etl_object_id=mapping_row.id,
+        )
         await _audit_complete(session, rag_audit, rag_agent, rag)
     except Exception as exc:
         await _audit_fail(session, rag_audit, exc, rag_agent)
