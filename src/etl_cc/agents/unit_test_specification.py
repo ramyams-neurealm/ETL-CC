@@ -287,6 +287,10 @@ class UnitTestSpecificationValidator:
             for transformation in mapping.transformations
             for port in transformation.ports
         }
+        parameter_defaults = {
+            parameter.name.casefold(): parameter.default_value
+            for parameter in mapping.parameters
+        }
         incoming: dict[
             tuple[str, str],
             list[tuple[str, str]],
@@ -315,6 +319,17 @@ class UnitTestSpecificationValidator:
             if port is not None:
                 expression = str(port.expression or "")
                 if cls._CLOCK.search(expression):
+                    return True
+                parameter_names = re.findall(
+                    r"\$([A-Za-z_][A-Za-z0-9_]*)",
+                    expression,
+                )
+                if any(
+                    cls._CLOCK.search(
+                        str(parameter_defaults.get(name.casefold()) or "")
+                    )
+                    for name in parameter_names
+                ):
                     return True
 
             # A pass-through transformation port has no expression. Continue

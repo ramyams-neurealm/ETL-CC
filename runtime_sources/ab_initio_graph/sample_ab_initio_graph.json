@@ -1,74 +1,86 @@
 {
   "format": "AB_INITIO_GRAPH_JSON",
   "format_version": "1.0",
-  "project": "accounts",
+  "project": "transactions",
   "graphs": [
     {
-      "name": "g_load_active_accounts",
-      "version": "synthetic-v1",
+      "name": "g_load_high_value_txns",
+      "version": "synthetic-v2",
       "parameters": [
         {
-          "name": "LOAD_DATE",
+          "name": "PROC_DATE",
           "parameter_type": "DATE",
           "data_type": "DATE",
           "default_value": "CURRENT_DATE",
+          "scope": "GRAPH"
+        },
+        {
+          "name": "THRESHOLD_AMT",
+          "parameter_type": "DECIMAL",
+          "data_type": "DECIMAL",
+          "default_value": "10000.00",
           "scope": "GRAPH"
         }
       ],
       "datasets": {
         "sources": [
           {
-            "name": "SRC_ACCOUNT",
-            "connection_name": "synthetic_accounts",
+            "name": "SRC_TRANSACTIONS",
+            "connection_name": "synthetic_txns_db",
             "fields": [
-              {"name": "ACCOUNT_ID", "data_type": "INTEGER", "nullable": false},
-              {"name": "ACCOUNT_STATUS", "data_type": "STRING", "nullable": false},
-              {"name": "ACCOUNT_BALANCE", "data_type": "DECIMAL", "precision": 12, "scale": 2, "nullable": true}
+              {"name": "TXN_ID", "data_type": "STRING", "nullable": false},
+              {"name": "CUSTOMER_ID", "data_type": "INTEGER", "nullable": false},
+              {"name": "TXN_AMOUNT", "data_type": "DECIMAL", "precision": 15, "scale": 2, "nullable": false},
+              {"name": "TXN_TYPE", "data_type": "STRING", "nullable": true}
             ]
           }
         ],
         "targets": [
           {
-            "name": "TGT_ACTIVE_ACCOUNT",
-            "connection_name": "synthetic_target",
+            "name": "TGT_HIGH_VALUE_ALERTS",
+            "connection_name": "synthetic_alerts_db",
             "fields": [
-              {"name": "ACCOUNT_ID", "data_type": "INTEGER", "nullable": false},
-              {"name": "ACCOUNT_BALANCE", "data_type": "DECIMAL", "precision": 12, "scale": 2, "nullable": true},
-              {"name": "LOAD_DATE", "data_type": "DATE", "nullable": false}
+              {"name": "ALERT_ID", "data_type": "STRING", "nullable": false},
+              {"name": "CUSTOMER_ID", "data_type": "INTEGER", "nullable": false},
+              {"name": "ALERT_AMOUNT", "data_type": "DECIMAL", "precision": 15, "scale": 2, "nullable": false},
+              {"name": "PROCESSED_ON", "data_type": "DATE", "nullable": false}
             ]
           }
         ]
       },
       "components": [
         {
-          "name": "FILTER_ACTIVE",
+          "name": "FILTER_HIGH_VALUE",
           "type": "FILTER",
-          "properties": {"condition": "ACCOUNT_STATUS == \\\"ACTIVE\\\""}
+          "properties": {"condition": "TXN_AMOUNT >= $THRESHOLD_AMT"}
         },
         {
-          "name": "REFORMAT_ACCOUNT",
+          "name": "REFORMAT_TO_ALERT",
           "type": "REFORMAT",
           "ports": [
-            {"name": "ACCOUNT_ID", "direction": "OUTPUT", "expression": "ACCOUNT_ID"},
-            {"name": "ACCOUNT_BALANCE", "direction": "OUTPUT", "expression": "ACCOUNT_BALANCE"},
-            {"name": "LOAD_DATE", "direction": "OUTPUT", "expression": "$LOAD_DATE"}
+            {"name": "ALERT_ID", "direction": "OUTPUT", "expression": "string_concat(\"ALRT_\", TXN_ID)"},
+            {"name": "CUSTOMER_ID", "direction": "OUTPUT", "expression": "CUSTOMER_ID"},
+            {"name": "ALERT_AMOUNT", "direction": "OUTPUT", "expression": "TXN_AMOUNT"},
+            {"name": "PROCESSED_ON", "direction": "OUTPUT", "expression": "$PROC_DATE"}
           ]
         }
       ],
       "edges": [
-        {"from_instance": "SRC_ACCOUNT", "to_instance": "FILTER_ACTIVE"},
-        {"from_instance": "FILTER_ACTIVE", "to_instance": "REFORMAT_ACCOUNT"},
-        {"from_instance": "REFORMAT_ACCOUNT", "to_instance": "TGT_ACTIVE_ACCOUNT"}
+        {"from_instance": "SRC_TRANSACTIONS", "to_instance": "FILTER_HIGH_VALUE"},
+        {"from_instance": "FILTER_HIGH_VALUE", "to_instance": "REFORMAT_TO_ALERT"},
+        {"from_instance": "REFORMAT_TO_ALERT", "to_instance": "TGT_HIGH_VALUE_ALERTS"}
       ],
       "field_links": [
-        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_ID", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_ID"},
-        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_STATUS", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_STATUS"},
-        {"from_instance": "SRC_ACCOUNT", "from_field": "ACCOUNT_BALANCE", "to_instance": "FILTER_ACTIVE", "to_field": "ACCOUNT_BALANCE"},
-        {"from_instance": "FILTER_ACTIVE", "from_field": "ACCOUNT_ID", "to_instance": "REFORMAT_ACCOUNT", "to_field": "ACCOUNT_ID"},
-        {"from_instance": "FILTER_ACTIVE", "from_field": "ACCOUNT_BALANCE", "to_instance": "REFORMAT_ACCOUNT", "to_field": "ACCOUNT_BALANCE"},
-        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "ACCOUNT_ID", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "ACCOUNT_ID"},
-        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "ACCOUNT_BALANCE", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "ACCOUNT_BALANCE"},
-        {"from_instance": "REFORMAT_ACCOUNT", "from_field": "LOAD_DATE", "to_instance": "TGT_ACTIVE_ACCOUNT", "to_field": "LOAD_DATE"}
+        {"from_instance": "SRC_TRANSACTIONS", "from_field": "TXN_ID", "to_instance": "FILTER_HIGH_VALUE", "to_field": "TXN_ID"},
+        {"from_instance": "SRC_TRANSACTIONS", "from_field": "CUSTOMER_ID", "to_instance": "FILTER_HIGH_VALUE", "to_field": "CUSTOMER_ID"},
+        {"from_instance": "SRC_TRANSACTIONS", "from_field": "TXN_AMOUNT", "to_instance": "FILTER_HIGH_VALUE", "to_field": "TXN_AMOUNT"},
+        {"from_instance": "FILTER_HIGH_VALUE", "from_field": "TXN_ID", "to_instance": "REFORMAT_TO_ALERT", "to_field": "TXN_ID"},
+        {"from_instance": "FILTER_HIGH_VALUE", "from_field": "CUSTOMER_ID", "to_instance": "REFORMAT_TO_ALERT", "to_field": "CUSTOMER_ID"},
+        {"from_instance": "FILTER_HIGH_VALUE", "from_field": "TXN_AMOUNT", "to_instance": "REFORMAT_TO_ALERT", "to_field": "TXN_AMOUNT"},
+        {"from_instance": "REFORMAT_TO_ALERT", "from_field": "ALERT_ID", "to_instance": "TGT_HIGH_VALUE_ALERTS", "to_field": "ALERT_ID"},
+        {"from_instance": "REFORMAT_TO_ALERT", "from_field": "CUSTOMER_ID", "to_instance": "TGT_HIGH_VALUE_ALERTS", "to_field": "CUSTOMER_ID"},
+        {"from_instance": "REFORMAT_TO_ALERT", "from_field": "ALERT_AMOUNT", "to_instance": "TGT_HIGH_VALUE_ALERTS", "to_field": "ALERT_AMOUNT"},
+        {"from_instance": "REFORMAT_TO_ALERT", "from_field": "PROCESSED_ON", "to_instance": "TGT_HIGH_VALUE_ALERTS", "to_field": "PROCESSED_ON"}
       ]
     }
   ]

@@ -4,6 +4,9 @@ from pathlib import Path
 import pytest
 
 from etl_cc.ab_initio_parser import AbInitioGraphParser, AbInitioGraphParserError
+from etl_cc.agents.matchflow_comparator import MatchFlowComparator
+from etl_cc.agents.unit_test_specification import UnitTestSpecificationValidator
+from etl_cc.agents.validation_agent import ValidationAgent
 
 
 FIXTURE = Path(__file__).parents[1] / "runtime_sources" / "ab_initio_graph" / "sample_ab_initio_graph.json"
@@ -31,3 +34,25 @@ def test_ab_initio_parser_rejects_other_json_formats():
 
     with pytest.raises(AbInitioGraphParserError):
         AbInitioGraphParser().list_mappings_bytes(content, "invalid.json")
+
+
+def test_runtime_parameter_default_is_recognized_as_clock_output():
+    mapping = AbInitioGraphParser().parse_file(FIXTURE)[0]
+    runtime_columns = ValidationAgent._runtime_generated_columns(mapping)
+
+    assert "LOAD_DATE" in UnitTestSpecificationValidator.runtime_fields(mapping)
+    assert "LOAD_DATE" in runtime_columns
+
+    match = MatchFlowComparator().compare_rows(
+        legacy_rows=[
+            {"ACCOUNT_ID": 1, "ACCOUNT_BALANCE": "100.00", "LOAD_DATE": "2000-01-01"}
+        ],
+        pyspark_rows=[
+            {"ACCOUNT_ID": 1, "ACCOUNT_BALANCE": "100.00", "LOAD_DATE": "2026-10-08"}
+        ],
+        keys=["ACCOUNT_ID"],
+        ignored_columns=runtime_columns,
+    )
+
+    assert match.match_percentage == 100.0
+    assert match.sample_differences == []

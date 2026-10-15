@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = 120.0
     openai_max_output_tokens: int | None = None
 
+    # --- GLiNER Configuration ---
+    enable_gliner: bool = True
+    gliner_model: str = "fastino/GLiNER2.5-Decide"
+    gliner_auto_convert_threshold: float = 0.90
+
+    artifact_directory_name: str = "runtime_artifacts"
+    rag_max_items: int = 8
+
     artifact_directory_name: str = "runtime_artifacts"
     rag_max_items: int = 8
     rag_embedding_deployment: str = "text-embedding-3-small"

@@ -34,7 +34,7 @@ from etl_cc.config import settings
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.models import CanonicalMapping
 from etl_cc.logging_config import configure_logging, metric, stage_completed, stage_failed, stage_started
-
+from etl_cc.gliner_service import gliner_service #gliner 
 
 logger = configure_logging("VALIDATION_AGENT")
 
@@ -455,6 +455,13 @@ class SafeExpression:
             text = decoded
         text = cls._split_sql_case(text)
         text = re.sub(r"\bSYSDATE\b", "validation_now()", text, flags=re.I)
+        text = re.sub(
+            r"\bCURRENT_DATE\b(?:\s*\(\s*\))?",
+            "validation_now()",
+            text,
+            flags=re.I,
+        )
+        
         text = re.sub(
             r"\bNOT\s+IN\s*\(([^()]*)\)",
             lambda item: f" not in [{item.group(1)}]",
@@ -2185,8 +2192,12 @@ class ValidationAgent:
         cls,
         mapping: CanonicalMapping,
     ) -> set[str]:
-        """Find output ports explicitly driven by runtime clock expressions."""
+        """Find output ports driven directly or through clock parameters."""
         columns: set[str] = set()
+        parameter_defaults = {
+            parameter.name.casefold(): str(parameter.default_value or "")
+            for parameter in mapping.parameters
+        }
         for transformation in mapping.transformations:
             for port in transformation.ports:
                 expression = str(port.expression or "").strip()
@@ -2195,7 +2206,20 @@ class ValidationAgent:
                     continue
                 if direction not in {"OUTPUT", "OUT", "OUTPUT/INPUT", "INOUT"}:
                     continue
-                if cls._NONDETERMINISTIC_CLOCK_PATTERN.search(expression):
+                parameter_names = re.findall(
+                    r"\$([A-Za-z_][A-Za-z0-9_]*)",
+                    expression,
+                )
+                parameter_is_clock = any(
+                    cls._NONDETERMINISTIC_CLOCK_PATTERN.search(
+                        parameter_defaults.get(name.casefold(), "")
+                    )
+                    for name in parameter_names
+                )
+                if (
+                    cls._NONDETERMINISTIC_CLOCK_PATTERN.search(expression)
+                    or parameter_is_clock
+                ):
                     columns.add(str(port.name))
         return columns
 
@@ -3025,6 +3049,29 @@ class ValidationAgent:
             >= context.minimum_functional_parity * 100
             and confidence >= threshold
         )
+
+         # --- GLiNER Validation Uncertainty Check ---
+        # 1. Keep inputs short to maintain speed
+        ref_cov = 100.0 if reference.full_reference_coverage else 0.0
+        checks_passed = static.passed_count + (1 if unit.status == "PASSED" else 0) + (1 if synthetic_validation.status == "PASSED" else 0)
+        
+        gliner_summary = (
+            f"Coverage: {ref_cov:.1f}%. "
+            f"Oracle strength: {reference.oracle_strength.value}. "
+            f"Checks passed: {checks_passed}."
+        )
+
+        # 2. Call the shared GLiNER adapter
+        gliner_res = gliner_service.check_validation_uncertainty(gliner_summary)
+
+        # 3. Advisory Only: GLiNER can only make outcomes stricter.
+        # It must never override a strict passed gate or MatchFlow failure.
+        if passed and gliner_res.get("uncertain"):
+            passed = False
+            reference.human_review_required = True
+            logger.info(f"GLiNER overturned deployable status due to uncertainty. Confidence: {gliner_res.get('confidence', 0.0):.2f}")
+        # -----------------------------------------
+
         reason, recommendation = self._failure(
             static,
             unit,

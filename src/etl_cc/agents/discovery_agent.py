@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.models import CanonicalMapping
+from etl_cc.gliner_service import gliner_service
 
 
 class DiscoveryBusinessRule(BaseModel):
@@ -111,6 +112,9 @@ class DiscoveryAnalysis(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     human_review_required: bool
 
+    gliner_decision: str = "HUMAN_REVIEW"  # <-- ADD THIS for gliner
+    gliner_confidence: float = 0.0 # <-- ADD THIS for gliner
+
 
 class DiscoveryAgent:
     """Analyze one CanonicalMapping without re-reading source XML."""
@@ -205,6 +209,16 @@ class DiscoveryAgent:
             or any(risk.severity in {"HIGH", "CRITICAL"} for risk in risks)
         )
 
+        # --- ADD THIS GLiNER ROUTING BLOCK ---
+        high_risks = sum(1 for r in risks if r.severity in {"HIGH", "CRITICAL"})
+        gliner_summary = (
+            f"Complexity: {level}. "
+            f"High risks: {high_risks}. "
+            f"Unsupported constructs: {len(unsupported)}."
+        )
+        gliner_res = gliner_service.decide_discovery_routing(gliner_summary)
+        # -------------------------------------
+
         return DiscoveryAnalysis(
             business_purpose=semantic.business_purpose,
             business_rules=rules,
@@ -219,6 +233,8 @@ class DiscoveryAgent:
             migration_recommendations=semantic.migration_recommendations,
             confidence=semantic.confidence,
             human_review_required=human_review,
+            gliner_decision=gliner_res["decision"],      # <-- ADD THIS gliner
+            gliner_confidence=gliner_res["confidence"],  # <-- ADD THIS gliner
         )
 
     async def _run_llm(

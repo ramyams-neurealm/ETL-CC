@@ -22,7 +22,7 @@ from etl_cc.informatica_parser import InformaticaXMLParser
 from etl_cc.models import AgentResponseETL, CanonicalMapping, ETLObjectETL, RepositoryETL, WorkflowEventETL, WorkflowRunETL
 from etl_cc.security import credential_cipher
 from etl_cc.source_store import consume_source_content, load_content, load_manifest
-
+from etl_cc.gliner_service import gliner_service
 
 def _hash(value: dict[str, Any]) -> str:
     text = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
@@ -267,14 +267,64 @@ async def _process(workflow_id: int) -> None:
         await session.commit()
 
 
+# async def _fail(workflow_id: int, exc: Exception) -> None:
+#     async with SessionFactory() as session:
+#         workflow = await session.get(WorkflowRunETL, workflow_id)
+#         if workflow:
+#             workflow.job_status = "FAILED"
+#             workflow.overall_status = "FAILED"
+#             workflow.failure_stage = workflow.current_stage or "DISCOVERY"
+#             workflow.failure_reason = str(exc)[:4000]
+#             workflow.completed_at = datetime.now(timezone.utc)
+#             await _event(
+#                 session,
+#                 workflow.id,
+#                 "WORKFLOW_FAILED",
+#                 "FAILED",
+#                 "Workflow failed.",
+#                 100,
+#                 {
+#                     "error_type": type(exc).__name__,
+#                     "reason": str(exc)[:4000],
+#                 },
+#             )
+#             await session.commit()
+
+
+
+  #updated fuction based on gliner triage
+  
 async def _fail(workflow_id: int, exc: Exception) -> None:
     async with SessionFactory() as session:
         workflow = await session.get(WorkflowRunETL, workflow_id)
         if workflow:
+            stage = workflow.current_stage or "DISCOVERY"
+            reason = str(exc)[:4000]
+            short_reason = str(exc).split('\n')[0][:200]
+
+            # 1. Plain code rules first for known exception types
+            if "ConnectionError" in reason or "TimeoutError" in reason:
+                triage_label = "Environment"
+                suggested_step = "Restart workers; ask operations"
+                confidence = 1.0
+            else:
+                # 2. GLiNER for messy free-text reasons
+                triage_res = gliner_service.triage_failure(stage, short_reason)
+                triage_label = triage_res["label"]
+                confidence = triage_res["confidence"]
+                suggested_step = triage_res["suggested_step"]
+
+            logger.info(f"Failure Triage: [{triage_label}] (Conf: {confidence:.2f}) -> {suggested_step}")
+
             workflow.job_status = "FAILED"
             workflow.overall_status = "FAILED"
-            workflow.failure_stage = workflow.current_stage or "DISCOVERY"
-            workflow.failure_reason = str(exc)[:4000]
+            workflow.failure_stage = stage
+            workflow.failure_reason = reason
+            
+            # Save the GLiNER triage results (ensure these columns exist on your model)
+            workflow.failure_category = triage_label
+            workflow.failure_suggested_step = suggested_step
+            
             workflow.completed_at = datetime.now(timezone.utc)
             await _event(
                 session,
@@ -285,10 +335,13 @@ async def _fail(workflow_id: int, exc: Exception) -> None:
                 100,
                 {
                     "error_type": type(exc).__name__,
-                    "reason": str(exc)[:4000],
+                    "reason": reason,
+                    "triage_category": triage_label,
+                    "suggested_step": suggested_step
                 },
             )
             await session.commit()
+
 
 
 async def run_worker() -> None:
