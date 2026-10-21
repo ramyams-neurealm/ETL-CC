@@ -427,7 +427,7 @@ async def _process_mapping(
             )
             raise
 
-        critique_agent = CritiqueAgent()
+        critique_agent = CritiqueAgent(mapping.source_vendor)
         critique_audit = await _audit_start(
             session,
             workflow,

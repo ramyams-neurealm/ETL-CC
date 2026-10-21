@@ -900,7 +900,7 @@ class DeploymentMappingResponse(BaseModel):
 
 
 class ETLIngestionMethodResponse(BaseModel):
-    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD", "DSX_UPLOAD"]
     method_name: str
     description: str
     enabled: bool

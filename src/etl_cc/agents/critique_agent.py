@@ -40,11 +40,16 @@ class CritiqueAgent:
     STAGE_NAME = "CONVERSION_CRITIQUE"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "PYSPARK_CONVERSION_CRITIQUE"
-    PROMPT_VERSION = "1.2.0"
+    PROMPT_VERSION = "1.3.0"
 
-    def __init__(self) -> None:
+    def __init__(self, source_vendor: str = "INFORMATICA") -> None:
+        self.source_vendor = source_vendor
         self.model_name = self.MODEL_NAME
-        self.prompt_name = self.PROMPT_NAME
+        self.prompt_name = (
+            self.PROMPT_NAME
+            if source_vendor.upper().startswith("INFORMATICA")
+            else f"{source_vendor.upper()}_{self.PROMPT_NAME}"
+        )
         self.prompt_version = self.PROMPT_VERSION
         self.input_tokens = 0
         self.output_tokens = 0
@@ -65,10 +70,20 @@ class CritiqueAgent:
             "conversion": conversion.model_dump(mode="json"),
             "deterministic_checks": [item.model_dump() for item in checks],
         }
-        prompt = """Review generated Databricks PySpark against supplied
-Informatica evidence. Never invent requirements. Treat failed deterministic
+        vendor_guidance = ""
+        if self.source_vendor.upper().startswith("DATASTAGE"):
+            vendor_guidance = """
+    DataStage-specific review:
+    - Treat canonical source/target schemas and stage links as authoritative.
+    - Stage inventory and OLEType identify components but do not establish source/target direction or data flow.
+    - Flag unsupported or ambiguous DataStage properties for manual review; do not infer behavior from stage names.
+    """.strip()
+        prompt = f"""Review generated Databricks PySpark against supplied
+    {self.source_vendor} evidence. Never invent requirements. Treat failed deterministic
 checks, missing grounded business rules, missing canonical target fields,
 syntax errors, secrets, TODOs, or placeholders as requiring revision.
+
+    {vendor_guidance}
 
 Field-role rules:
 - Require final projection only for canonical target fields.

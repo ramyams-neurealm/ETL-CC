@@ -74,9 +74,14 @@ async def _load_mappings(session: AsyncSession, repository: RepositoryETL, workf
         parser = get_parser(
             manifest["product_code"], manifest["method_code"]
         )
+        source_vendor = (
+            "DATASTAGE_DSX"
+            if manifest["product_code"] == "DATASTAGE"
+            else "INFORMATICA_XML_UPLOAD"
+        )
         return parser.parse_selected_bytes(
             content, set(selected) if selected else None,
-            "INFORMATICA_XML_UPLOAD", manifest["config"]["original_file_name"],
+            source_vendor, manifest["config"]["original_file_name"],
         )
     source = await _source(session, repository, workflow)
     if source is None:

@@ -1,4 +1,4 @@
-"""GPT-4o conversion agent for Informatica-to-Databricks PySpark migration."""
+"""GPT-4o conversion agent for ETL-to-Databricks PySpark migration."""
 
 import ast
 import json
@@ -37,15 +37,19 @@ class ConversionOutputValidationError(RuntimeError):
     """Raised when generated artifacts violate the conversion contract."""
 
 
+class ConversionInputValidationError(ValueError):
+    """Raised when canonical source evidence is insufficient for conversion."""
+
+
 class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "2.4.0"
+    AGENT_VERSION = "2.5.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "INFORMATICA_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "2.4.0"
+    PROMPT_VERSION = "2.5.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
@@ -114,6 +118,7 @@ class ConversionAgent:
         critique_feedback: list[dict[str, Any]] | None = None,
     ) -> ConversionResult:
         """Generate and validate one conversion result."""
+        self._validate_mapping_readiness(mapping)
 
         evidence = {
             "canonical_mapping": mapping.model_dump(mode="json"),
@@ -139,8 +144,21 @@ class ConversionAgent:
             },
         }
 
+        vendor_guidance = ""
+        if self.source_vendor.upper().startswith("DATASTAGE"):
+            vendor_guidance = """
+    DATASTAGE DSX RULES:
+    - Use canonical sources, targets, connectors, transformations, and ports as the only executable mapping evidence.
+    - Treat source_metadata.stage_inventory as component inventory only. It does not define a dataset schema or prove connector direction.
+    - Never infer source or target roles from component names such as SRC_* or TGT_* or from an OLEType such as OracleConnector.
+    - Convert only expressions present in canonical transformation ports. Stage names and OLEType values alone do not define business logic.
+    - Surface unsupported or ambiguous DataStage properties as manual_actions; do not invent connector behavior, schemas, or field mappings.
+    """.strip()
+
         system_prompt = f"""
 You are the Conversion Agent for an ETL migration system.
+
+    {vendor_guidance}
 
 Convert exactly one supplied {self.source_vendor} Canonical Mapping into
 validation-friendly Databricks PySpark. Use only supplied evidence. Do not
@@ -246,6 +264,31 @@ Return only the requested structured output.
         self._capture_usage(raw)
         self._validate_result(parsed, mapping)
         return parsed
+
+    def _validate_mapping_readiness(self, mapping: CanonicalMapping) -> None:
+        """Require complete source evidence before converting a DataStage job."""
+        if not mapping.source_vendor.upper().startswith("DATASTAGE"):
+            return
+
+        missing: list[str] = []
+        if not mapping.sources:
+            missing.append("source datasets")
+        if not mapping.targets:
+            missing.append("target datasets")
+        if not mapping.connectors:
+            missing.append("DSX stage links")
+        if any(not dataset.fields for dataset in mapping.sources):
+            missing.append("source field schemas")
+        if any(not dataset.fields for dataset in mapping.targets):
+            missing.append("target field schemas")
+
+        if missing:
+            raise ConversionInputValidationError(
+                "DataStage mapping is not ready for conversion; missing "
+                + ", ".join(missing)
+                + ". Re-export or complete the DSX mapping metadata before "
+                "requesting conversion."
+            )
 
     def _normalize_configuration(
         self,

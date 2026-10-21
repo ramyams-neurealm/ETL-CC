@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     enable_informatica_powercenter: bool = True
     enable_informatica_github: bool = True
     enable_informatica_xml_upload: bool = True
-    enable_datastage: bool = False
+    enable_datastage: bool = True   
     enable_ab_initio: bool = False
 
     azure_tenant_id: str

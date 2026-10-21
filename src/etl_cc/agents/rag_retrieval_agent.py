@@ -45,10 +45,12 @@ class RAGRetrievalAgent:
                 ),
             )
         )).all())
+        source_vendor = mapping.source_vendor.lower()
         terms = {
             mapping.mapping_name.lower(),
             "pyspark",
-            "informatica",
+            source_vendor,
+            source_vendor.split("_", 1)[0],
             *(item.transformation_type.lower() for item in mapping.transformations),
         }
         scored = []
