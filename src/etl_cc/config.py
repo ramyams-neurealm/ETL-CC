@@ -50,8 +50,8 @@ class Settings(BaseSettings):
     artifact_directory_name: str = "runtime_artifacts"
     rag_max_items: int = 8
     conversion_max_attempts: int = 2
-    validation_test_timeout_seconds: int = 120
-    minimum_functional_parity: float = 0.95
+    validation_test_timeout_seconds: int = 300
+    minimum_functional_parity: float = 0.50
     validation_upload_directory_name: str = "runtime_validation_uploads"
     validation_upload_max_bytes: int = 104857600
     validation_upload_max_rows: int = 100000

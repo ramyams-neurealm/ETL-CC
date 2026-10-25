@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,15 @@ async def _claim() -> int | None:
             row.current_stage = "DISCOVERY"
             row.started_at = datetime.now(timezone.utc)
             row.attempt_count += 1
+            log_event(
+                logger,
+                "DISCOVERY_WORKFLOW_CLAIMED",
+                workflow_id=row.workflow_id,
+                workflow_run_id=row.id,
+                repository_id=row.repository_id,
+                attempt_count=row.attempt_count,
+                priority=row.priority,
+            )
             return row.id
 
 
@@ -130,8 +140,16 @@ async def _run_mapping_agent(session: AsyncSession, workflow: WorkflowRunETL, re
         agent_name=agent.AGENT_NAME,
         stage_name=agent.STAGE_NAME,
         attempt_number=attempt,
-        request_payload=audit.request_payload,
+        request_summary={
+            "source_object_key": mapping.source_object_key,
+            "source_vendor": mapping.source_vendor,
+            "source_count": len(mapping.sources),
+            "target_count": len(mapping.targets),
+            "transformation_count": len(mapping.transformations),
+            "connector_count": len(mapping.connectors),
+        },
     )
+    agent_started = time.perf_counter()
     try:
         result = await agent.run(mapping)
         audit.status = "COMPLETED"
@@ -157,7 +175,19 @@ async def _run_mapping_agent(session: AsyncSession, workflow: WorkflowRunETL, re
             attempt_number=attempt,
             input_tokens=audit.input_tokens,
             output_tokens=audit.output_tokens,
-            response_payload=audit.response_payload,
+            duration_ms=round((time.perf_counter() - agent_started) * 1000, 2),
+            result_summary={
+                "result_type": type(result).__name__,
+                "business_rule_count": len(
+                    getattr(result, "business_rules", []) or []
+                ),
+                "risk_count": len(getattr(result, "risks", []) or []),
+                "warning_count": len(getattr(result, "warnings", []) or []),
+                "confidence": getattr(result, "confidence", None),
+                "human_review_required": getattr(
+                    result, "human_review_required", None
+                ),
+            },
         )
         return result
     except Exception as exc:
@@ -183,6 +213,7 @@ async def _run_mapping_agent(session: AsyncSession, workflow: WorkflowRunETL, re
             agent_name=agent.AGENT_NAME,
             stage_name=agent.STAGE_NAME,
             attempt_number=attempt,
+            duration_ms=round((time.perf_counter() - agent_started) * 1000, 2),
         )
         raise
 
@@ -195,6 +226,15 @@ async def _run_planner(session: AsyncSession, workflow: WorkflowRunETL, reposito
     await session.flush()
     await _event(session, workflow.id, "DEPENDENCY_PLANNING_STARTED", "RUNNING", "Repository dependency planning started.", 92, {"mapping_count": len(mappings)}, planner.STAGE_NAME, audit.id)
     await session.commit()
+    planner_started = time.perf_counter()
+    log_event(
+        logger,
+        "DEPENDENCY_PLANNING_STARTED",
+        workflow_id=workflow.workflow_id,
+        repository_id=repository.id,
+        mapping_count=len(mappings),
+        attempt_number=attempt,
+    )
     try:
         plan = await planner.run(mappings)
         audit.status = "COMPLETED"
@@ -210,33 +250,108 @@ async def _run_planner(session: AsyncSession, workflow: WorkflowRunETL, reposito
             row.migration_wave = map_plan.migration_wave
         await _event(session, workflow.id, "DEPENDENCY_PLANNING_COMPLETED", "COMPLETED", "Repository dependency planning completed.", 98, {"dependency_count": len(plan.dependencies), "wave_count": len(plan.migration_waves), "has_dependency_cycle": plan.has_dependency_cycle}, planner.STAGE_NAME, audit.id)
         await session.commit()
+        log_event(
+            logger,
+            "DEPENDENCY_PLANNING_COMPLETED",
+            workflow_id=workflow.workflow_id,
+            repository_id=repository.id,
+            mapping_count=len(mappings),
+            dependency_count=len(plan.dependencies),
+            wave_count=len(plan.migration_waves),
+            has_dependency_cycle=plan.has_dependency_cycle,
+            duration_ms=round((time.perf_counter() - planner_started) * 1000, 2),
+        )
         return plan
     except Exception as exc:
         audit.status = "FAILED"
         audit.error_message = str(exc)[:4000]
         audit.completed_at = datetime.now(timezone.utc)
         await session.commit()
+        log_exception(
+            logger,
+            "DEPENDENCY_PLANNING_FAILED",
+            exc,
+            workflow_id=workflow.workflow_id,
+            repository_id=repository.id,
+            mapping_count=len(mappings),
+            duration_ms=round((time.perf_counter() - planner_started) * 1000, 2),
+        )
         raise
 
 
 async def _process(workflow_id: int) -> None:
+    workflow_started = time.perf_counter()
     async with SessionFactory() as session:
         workflow = await session.get(WorkflowRunETL, workflow_id)
         repository = await session.get(RepositoryETL, workflow.repository_id) if workflow else None
         if workflow is None or repository is None:
             raise ValueError("Workflow or repository was not found.")
+        log_event(
+            logger,
+            "DISCOVERY_WORKFLOW_STARTED",
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow.id,
+            repository_id=repository.id,
+            connection_type=repository.connection_type,
+            attempt_count=workflow.attempt_count,
+            selected_mapping_count=len(
+                workflow.scope_payload.get("selected_mapping_keys") or []
+            ),
+        )
         await _event(session, workflow.id, "DISCOVERY_STARTED", "RUNNING", "Mapping discovery started.", 5, {"connection_type": repository.connection_type})
         await session.commit()
+        source_started = time.perf_counter()
         log_event(logger, "SOURCE_LOAD_STARTED", workflow_id=workflow.workflow_id, repository_id=repository.id, connection_type=repository.connection_type)
         mappings = await _load_mappings(session, repository, workflow)
-        log_event(logger, "CANONICAL_MAPPINGS_LOADED", workflow_id=workflow.workflow_id, repository_id=repository.id, mapping_count=len(mappings), mappings=[item.model_dump(mode="json") for item in mappings])
+        log_event(
+            logger,
+            "SOURCE_LOAD_COMPLETED",
+            workflow_id=workflow.workflow_id,
+            repository_id=repository.id,
+            connection_type=repository.connection_type,
+            mapping_count=len(mappings),
+            duration_ms=round((time.perf_counter() - source_started) * 1000, 2),
+        )
+        log_event(
+            logger,
+            "CANONICAL_MAPPINGS_LOADED",
+            workflow_id=workflow.workflow_id,
+            repository_id=repository.id,
+            mapping_count=len(mappings),
+            mappings=[
+                {
+                    "mapping_name": item.mapping_name,
+                    "source_object_key": item.source_object_key,
+                    "source_count": len(item.sources),
+                    "target_count": len(item.targets),
+                    "transformation_count": len(item.transformations),
+                    "connector_count": len(item.connectors),
+                }
+                for item in mappings
+            ],
+        )
         if not mappings:
             raise ValueError("No mappings matched the discovery scope.")
         rows: dict[str, ETLObjectETL] = {}
         total = len(mappings)
         for index, mapping in enumerate(mappings, 1):
+            mapping_started = time.perf_counter()
             row = await _upsert(session, repository, mapping)
             rows[mapping.source_object_key] = row
+            log_event(
+                logger,
+                "MAPPING_DISCOVERY_STARTED",
+                workflow_id=workflow.workflow_id,
+                repository_id=repository.id,
+                etl_object_id=row.id,
+                mapping_name=mapping.mapping_name,
+                source_object_key=mapping.source_object_key,
+                mapping_index=index,
+                mapping_count=total,
+                source_count=len(mapping.sources),
+                target_count=len(mapping.targets),
+                transformation_count=len(mapping.transformations),
+            )
             await _event(session, workflow.id, "MAPPING_DISCOVERED", "RUNNING", f"Discovered {mapping.mapping_name}.", 10 + int(index / total * 15), {"etl_object_id": row.id})
             await session.commit()
             discovery = await _run_mapping_agent(session, workflow, repository, row, mapping, DiscoveryAgent(), 25 + int(index / total * 20))
@@ -253,6 +368,22 @@ async def _process(workflow_id: int) -> None:
             row.lineage = lineage.model_dump(mode="json")
             row.discovery_status = "ANALYZED"
             await session.commit()
+            log_event(
+                logger,
+                "MAPPING_DISCOVERY_COMPLETED",
+                workflow_id=workflow.workflow_id,
+                repository_id=repository.id,
+                etl_object_id=row.id,
+                mapping_name=mapping.mapping_name,
+                source_object_key=mapping.source_object_key,
+                business_rule_count=len(discovery.business_rules),
+                prerequisite_count=len(discovery.prerequisites),
+                risk_count=len(discovery.risks),
+                lineage_field_count=len(lineage.field_lineage),
+                lineage_warning_count=len(lineage.warnings),
+                confidence=lineage.confidence,
+                duration_ms=round((time.perf_counter() - mapping_started) * 1000, 2),
+            )
         await _run_planner(session, workflow, repository, mappings, rows)
         repository.last_discovered_at = datetime.now(timezone.utc)
         workflow.job_status = "COMPLETED"
@@ -265,22 +396,53 @@ async def _process(workflow_id: int) -> None:
             await consume_source_content(session, workflow.scope_payload["source_id"])
         await _event(session, workflow.id, "DEPENDENCY_PLANNING_WORKFLOW_COMPLETED", "COMPLETED", "Discovery, lineage, and dependency planning completed.", 100, {"mapping_count": total}, "DEPENDENCY_PLANNING")
         await session.commit()
+        log_event(
+            logger,
+            "DISCOVERY_WORKFLOW_COMPLETED",
+            workflow_id=workflow.workflow_id,
+            workflow_run_id=workflow.id,
+            repository_id=repository.id,
+            mapping_count=total,
+            duration_ms=round((time.perf_counter() - workflow_started) * 1000, 2),
+        )
 
 
 async def _fail(workflow_id: int, exc: Exception) -> None:
     async with SessionFactory() as session:
         workflow = await session.get(WorkflowRunETL, workflow_id)
         if workflow:
+            failed_at = datetime.now(timezone.utc)
+            duration_ms = (
+                round((failed_at - workflow.started_at).total_seconds() * 1000, 2)
+                if workflow.started_at
+                else None
+            )
             workflow.job_status = "FAILED"
             workflow.overall_status = "FAILED"
             workflow.failure_stage = workflow.current_stage or "DISCOVERY"
             workflow.failure_reason = str(exc)[:4000]
-            workflow.completed_at = datetime.now(timezone.utc)
+            workflow.completed_at = failed_at
+            log_exception(
+                logger,
+                "DISCOVERY_WORKFLOW_FAILED",
+                exc,
+                workflow_id=workflow.workflow_id,
+                workflow_run_id=workflow.id,
+                repository_id=workflow.repository_id,
+                current_stage=workflow.current_stage,
+                attempt_count=workflow.attempt_count,
+                duration_ms=duration_ms,
+            )
             await _event(session, workflow.id, "WORKFLOW_FAILED", "FAILED", "Workflow failed.", 100, {"error_type": type(exc).__name__})
             await session.commit()
 
 
 async def run_worker() -> None:
+    log_event(
+        logger,
+        "DISCOVERY_WORKER_STARTED",
+        poll_interval_seconds=settings.worker_poll_seconds,
+    )
     while True:
         workflow_id = await _claim()
         if workflow_id is None:

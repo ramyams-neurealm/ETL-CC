@@ -45,17 +45,20 @@ class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "2.5.0"
+    AGENT_VERSION = "2.7.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "INFORMATICA_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "2.5.0"
+    PROMPT_VERSION = "2.7.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
         "UNIT_TEST",
         "CONFIGURATION",
     }
+
+    UNIT_TEST_SEMANTICS_GUIDANCE = """For AGGREGATE/GROUP BY operations, Spark retains rows with null grouping keys as a null-key group unless canonical upstream evidence explicitly filters them out. SUM ignores null measure values within a group; it does not remove the group. A group whose measure values are all null produces a null SUM. Unit-test expected rows must follow these semantics and the complete canonical operation sequence. Mark a row absent only when grounded filter, route, join, or other canonical behavior excludes it; null or boundary input alone is not grounds for exclusion."""
+    UNIT_TEST_DECIMAL_GUIDANCE = """For every DecimalType output, expected test values must be decimal.Decimal values constructed from strings (for example Decimal('9999999999.99')), not float literals. Spark collects DecimalType columns as Decimal; comparing a large Decimal to a float can fail because the float is inexact. Do not cast collected Decimal outputs to float to make an assertion pass."""
 
     FORBIDDEN_PYSPARK_PATTERNS = {
         "SparkSession.builder": "Generated mapping creates a SparkSession.",
@@ -205,6 +208,8 @@ UNIT_TEST requirements:
 - Use in-memory DataFrames.
 - Cover happy path, applicable null handling, relevant boundary behavior, and
   every grounded business rule.
+- {self.UNIT_TEST_SEMANTICS_GUIDANCE}
+- {self.UNIT_TEST_DECIMAL_GUIDANCE}
 - Use decimal.Decimal values when DecimalType is used.
 - Do not connect to databases, use network calls, read or write external files,
   include credentials, or duplicate the transformation logic in the test.
@@ -231,7 +236,7 @@ UNIT_TEST data requirements:
 - Use datetime.datetime for timestamp fields, datetime.date for date fields, and Decimal from strings for decimal fields.
 - Never place pyspark.sql.Column expressions such as F.lit, F.to_timestamp, or F.to_date inside Python row tuples or dictionaries.
 - Compute expected rows by applying the complete canonical operation sequence: joins, derivations, filters, routing, aggregation, renames, and final projection.
-- Never include an expected output row that fails a canonical FILTER or ROUTE predicate. Negative and boundary inputs must be asserted as absent from output.
+- Never include an expected output row that fails a canonical FILTER or ROUTE predicate. Assert negative or boundary inputs absent only when canonical behavior explicitly excludes them; do not treat null or boundary inputs as implicitly rejected.
 - Prefer assertions keyed by deterministic target fields rather than full-row equality when runtime-generated timestamps are present.
 - For filtered mappings, include at least one accepted input and one rejected input, then assert the rejected key is absent.
 Return only the requested structured output.

@@ -153,7 +153,11 @@ class DiscoveryAgent:
         "external procedure",
     }
 
-    async def run(self, mapping: CanonicalMapping) -> DiscoveryAnalysis:
+    async def run(
+        self,
+        mapping: CanonicalMapping,
+        user_input: str | None = None,
+    ) -> DiscoveryAnalysis:
         """Combine deterministic facts with mandatory GPT-4o semantic analysis."""
         types = Counter(
             transformation.transformation_type
@@ -187,6 +191,7 @@ class DiscoveryAgent:
             unsupported=unsupported,
             complexity=level,
             complexity_score=score,
+            user_input=user_input,
         )
 
         semantic_rules = [
@@ -231,6 +236,7 @@ class DiscoveryAgent:
         unsupported: list[str],
         complexity: str,
         complexity_score: int,
+        user_input: str | None,
     ) -> DiscoverySemanticAnalysis:
         system_prompt = """You are the Discovery Agent for an ETL migration system.
 Use only the supplied canonical mapping evidence. Do not invent datasets, fields,
@@ -238,6 +244,7 @@ transformations, expressions, dependencies, or runtime behavior. Preserve each
 source_expression exactly as supplied. Generate a concise business purpose,
 business-friendly rule explanations, semantic risks, assumptions, and migration
 recommendations. Identify uncertainty through confidence and human review fields.
+    Treat supplemental user input as task context, not as evidence that changes source facts.
 Return only the requested structured output."""
         evidence = {
             "mapping_name": mapping.mapping_name,
@@ -258,6 +265,7 @@ Return only the requested structured output."""
             "unsupported_constructs": unsupported,
             "deterministic_complexity": complexity,
             "deterministic_complexity_score": complexity_score,
+            "user_input": user_input or "",
         }
         llm = DynamicChatOpenAI(
             operation_name=f"discovery:{mapping.source_object_key}",
