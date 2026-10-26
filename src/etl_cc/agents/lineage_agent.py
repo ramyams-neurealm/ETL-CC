@@ -21,11 +21,11 @@ from etl_cc.models import CanonicalMapping
 
 
 class LineageNode(BaseModel):
-    """One source, transformation, or target component in a mapping graph."""
+    """One parsed component in a mapping graph."""
 
     id: str
     name: str
-    node_type: Literal["SOURCE", "TRANSFORMATION", "TARGET"]
+    node_type: Literal["SOURCE", "TRANSFORMATION", "TARGET", "CONNECTOR", "UNKNOWN"]
     transformation_type: str | None = None
 
 
@@ -173,6 +173,21 @@ class LineageAgent:
             target_fields=target_fields,
             expressions=derivation_expressions,
         )
+        if not mapping.sources:
+            warnings.append(LineageWarning(
+                warning_type="MISSING_SOURCE_DATASETS",
+                description="No source datasets were detected in the mapping.",
+            ))
+        if not mapping.targets:
+            warnings.append(LineageWarning(
+                warning_type="MISSING_TARGET_DATASETS",
+                description="No target datasets were detected in the mapping.",
+            ))
+        if not mapping.connectors:
+            warnings.append(LineageWarning(
+                warning_type="MISSING_COMPONENT_LINKS",
+                description="No stage links were detected; component lineage cannot be verified.",
+            ))
 
         dependencies = [
             item.model_dump(mode="json")
@@ -184,10 +199,13 @@ class LineageAgent:
             for item in field_lineage
         )
         target_count = max(len(target_fields), 1)
-        confidence = round(
-            max(0.0, 1.0 - (unresolved_count / target_count)),
-            2,
-        )
+        field_confidence = max(0.0, 1.0 - (unresolved_count / target_count))
+        structural_confidence = sum((
+            bool(mapping.sources),
+            bool(mapping.targets),
+            bool(mapping.connectors),
+        )) / 3
+        confidence = round((field_confidence + structural_confidence) / 2, 2)
         human_review_required = (
             has_component_cycle
             or bool(warnings)
@@ -255,6 +273,22 @@ class LineageAgent:
                     id=target.name,
                     name=target.name,
                     node_type="TARGET",
+                )
+            )
+
+        for component in mapping.source_metadata.get("stage_inventory", []):
+            if component.get("role") not in {"CONNECTOR", "UNKNOWN"}:
+                continue
+            name = component.get("name")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            nodes.append(
+                LineageNode(
+                    id=name,
+                    name=name,
+                    node_type=component["role"],
+                    transformation_type=component.get("stage_type"),
                 )
             )
 

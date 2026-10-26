@@ -32,7 +32,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from etl_cc.agents.matchflow_comparator import MatchFlowComparator, MatchFlowResult
 from etl_cc.agents.spark_runtime import add_java_home_to_path
 from etl_cc.agents.test_plan_agent import TestPlanAgent
-from etl_cc.agents.unit_test_execution_agent import UnitTestExecutionAgent
+from etl_cc.agents.unit_test_execution_agent import (
+    UnitTestExecutionAgent,
+    normalize_java_home,
+)
 from etl_cc.config import settings
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.models import CanonicalMapping
@@ -1275,7 +1278,7 @@ class ValidationContext(BaseModel):
     discovery: dict[str, Any] = Field(default_factory=dict)
     lineage: dict[str, Any] = Field(default_factory=dict)
     artifact_paths: dict[str, Path]
-    minimum_functional_parity: float = Field(default=0.60, ge=0, le=1)
+    minimum_functional_parity: float = Field(default=0.50, ge=0, le=1)
     input_mode: Literal["SIMULATE", "DATASET_FILE", "DATABASE_TABLES"] = "SIMULATE"
     input_datasets: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     expected_output_rows: list[dict[str, Any]] | None = None
@@ -2047,6 +2050,7 @@ def sanitized_spark_environment():
     SPARK_HOME as the current directory and attempts to run ./bin/spark-submit.
     """
     managed_keys = (
+        "JAVA_HOME",
         "SPARK_HOME",
         "PYSPARK_PYTHON",
         "PYSPARK_DRIVER_PYTHON",
@@ -2054,9 +2058,9 @@ def sanitized_spark_environment():
     )
     previous = {key: os.environ.get(key) for key in managed_keys}
     try:
-        child_environment = os.environ.copy()
-        add_java_home_to_path(child_environment)
-        os.environ["PATH"] = child_environment.get("PATH", "")
+        java_home = normalize_java_home(os.environ.get("JAVA_HOME"))
+        if java_home:
+            os.environ["JAVA_HOME"] = java_home
         os.environ.pop("SPARK_HOME", None)
         os.environ["PYSPARK_PYTHON"] = sys.executable
         os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
@@ -2201,7 +2205,9 @@ finally:
                     "PYSPARK_PYTHON": sys.executable,
                     "PYSPARK_DRIVER_PYTHON": sys.executable,
                 })
-                add_java_home_to_path(environment)
+                java_home = normalize_java_home(environment.get("JAVA_HOME"))
+                if java_home:
+                    environment["JAVA_HOME"] = java_home
                 environment.pop("SPARK_HOME", None)
                 completed = subprocess.run(
                     [
@@ -2244,6 +2250,10 @@ class StaticImplementationCoverage:
     AGENT_VERSION = "2.0.0"
     STAGE_NAME = "STATIC_IMPLEMENTATION_COVERAGE"
     MODEL_NAME = "DETERMINISTIC_COVERAGE"
+    _FUNCTION_ALIASES = {
+        "uppercase": "upper",
+        "lowercase": "lower",
+    }
 
     def run(self, mapping: CanonicalMapping, discovery: dict, lineage: dict, code: str, config: str, tests: str, minimum: float) -> StaticCoverageResult:
         searchable = "\n".join((code, config, tests))

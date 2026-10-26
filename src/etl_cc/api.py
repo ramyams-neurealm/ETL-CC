@@ -205,6 +205,17 @@ async def list_etl_products() -> ETLProductsResponse:
             ),
             display_order=3,
         ),
+        ETLIngestionMethodResponse(
+            method_code="DSX_UPLOAD",
+            method_name="DataStage DSX Upload",
+            description="Upload an IBM DataStage DSX export directly.",
+            enabled=settings.enable_datastage,
+            disabled_reason=(
+                None if settings.enable_datastage
+                else "This ingestion method is not enabled."
+            ),
+            display_order=4,
+        ),
     ]
 
     return ETLProductsResponse(
@@ -215,11 +226,13 @@ async def list_etl_products() -> ETLProductsResponse:
                 description="PowerCenter mappings",
                 enabled=informatica_enabled and any(
                     method.enabled for method in methods
+                    if method.method_code != "DSX_UPLOAD"
                 ),
                 disabled_reason=(
                     None
                     if informatica_enabled and any(
                         method.enabled for method in methods
+                        if method.method_code != "DSX_UPLOAD"
                     )
                     else "Informatica ingestion is not enabled."
                 ),
@@ -231,11 +244,14 @@ async def list_etl_products() -> ETLProductsResponse:
                 product_code="DATASTAGE",
                 product_name="IBM DataStage",
                 description="DataStage jobs",
-                enabled=True,
-                disabled_reason=None,
+                enabled=settings.enable_datastage,
+                disabled_reason=(
+                    None if settings.enable_datastage
+                    else "DataStage ingestion is not enabled."
+                ),
                 icon_key="datastage",
                 display_order=2,
-                ingestion_methods=[],
+                ingestion_methods=[methods[-1]],
             ),
             ETLProductResponse(
                 product_code="AB_INITIO",
@@ -338,7 +354,81 @@ async def test_github(
             },
         ) from exc
 
+#1
+# @router.post(
+#     "/sources/xml/analyze",
+#     response_model=SourceAnalysisResponse,
+#     tags=["Sources"],
+# )
+# async def analyze_xml(
+#     product_code: str = Form(...),
+#     method_code: str = Form(...),
+#     connection_name: str = Form(...),
+#     file: UploadFile | None = File(default=None),
+#     files: list[UploadFile] | None = File(default=None),
+#     environment: str = Form("DEV"),
+#     session: AsyncSession = Depends(get_session),
+# ):
+#     try:
+#         if environment not in {"DEV", "STAGING", "PROD"}:
+#             raise ValueError("Environment must be DEV, STAGING, or PROD.")
+#         # uploads=[]
+#         # if file is not None: uploads.append((file.filename or "upload.xml", await file.read()))
+#         # #for item in files or []: uploads.append((item.filename or "upload.xml", await item.read()))
+#         #         if files:
+#         #     if not isinstance(files, list):
+#         #         files = [files]
+        
+#         #     for item in files:
+#         #         uploads.append(
+#         #             (item.filename or "upload.xml", await item.read())
+#         #         )
+#         uploads = []
+#         if isinstance(file, UploadFile):
+#             uploads.append((file.filename or "upload.xml", await file.read()))
 
+#         if isinstance(files, list):
+#             for item in files:
+#                 if isinstance(item, UploadFile):
+#                     uploads.append((item.filename or "upload.xml", await item.read()))
+#         elif isinstance(files, UploadFile):
+#             uploads.append((files.filename or "upload.xml", await files.read()))
+#         if not uploads: raise ValueError("At least one XML or ZIP file is required.")
+#         return await analyze_xml_upload(session,product_code,method_code,connection_name,environment,uploaded_files=uploads)
+#     except ValueError as exc:
+#         raise HTTPException(
+#             status_code=400,
+#             detail={
+#                 "status": "FAILED",
+#                 "stage": "XML_VALIDATION",
+#                 "reason": str(exc),
+#             },
+#         ) from exc
+
+
+# @router.post(
+#     "/sources/dsx/analyze",
+#     response_model=SourceAnalysisResponse,
+#     tags=["Sources"],
+#     summary="Analyze DataStage DSX upload",
+# )
+# async def analyze_dsx(
+#     product_code: str = Form(...),
+#     method_code: str = Form(...),
+#     connection_name: str = Form(...),
+#     file: UploadFile = File(...),
+#     environment: str = Form("DEV"),
+#     session: AsyncSession = Depends(get_session),
+# ):
+#     return await analyze_xml(
+#         product_code=product_code,
+#         method_code=method_code,
+#         connection_name=connection_name,
+#         file=file,
+#         files=None,
+#         environment=environment,
+#         session=session,
+#     )
 @router.post(
     "/sources/xml/analyze",
     response_model=SourceAnalysisResponse,
@@ -348,19 +438,25 @@ async def analyze_xml(
     product_code: str = Form(...),
     method_code: str = Form(...),
     connection_name: str = Form(...),
-    file: UploadFile | None = File(default=None),
-    files: list[UploadFile] | None = File(default=None),
+    file: UploadFile = File(...),
     environment: str = Form("DEV"),
     session: AsyncSession = Depends(get_session),
 ):
     try:
         if environment not in {"DEV", "STAGING", "PROD"}:
             raise ValueError("Environment must be DEV, STAGING, or PROD.")
-        uploads=[]
-        if file is not None: uploads.append((file.filename or "upload.xml", await file.read()))
-        for item in files or []: uploads.append((item.filename or "upload.xml", await item.read()))
-        if not uploads: raise ValueError("At least one XML or ZIP file is required.")
-        return await analyze_xml_upload(session,product_code,method_code,connection_name,environment,uploaded_files=uploads)
+        content = await file.read()
+        if not content:
+            raise ValueError("The uploaded XML file is empty.")
+        return await analyze_xml_upload(
+            session=session,
+            product_code=product_code,
+            method_code=method_code,
+            connection_name=connection_name,
+            environment=environment,
+            file_name=file.filename or "upload.xml",
+            content=content,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -407,6 +503,81 @@ async def analyze_ab_initio(
             },
         ) from exc
 
+
+@router.post(
+    "/sources/ab-initio/analyze",
+    response_model=SourceAnalysisResponse,
+    tags=["Sources"],
+)
+async def analyze_ab_initio(
+    connection_name: str = Form(...),
+    environment: EnvironmentType = Form(...),
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        if not settings.enable_ab_initio:
+            raise ValueError("Ab Initio ingestion is not enabled.")
+        request = AbInitioGraphUploadRequest(
+            connection_name=connection_name,
+            environment=environment,
+        )
+        return await analyze_ab_initio_graph(
+            session,
+            request,
+            file.filename or "ab_initio_graph.mp",
+            await file.read(),
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "FAILED",
+                "stage": "AB_INITIO_VALIDATION",
+                "reason": str(exc),
+            },
+        ) from exc
+
+
+@router.post(
+    "/sources/dsx/analyze",
+    response_model=SourceAnalysisResponse,
+    tags=["Sources"],
+    summary="Analyze DataStage DSX upload",
+)
+async def analyze_dsx(
+    product_code: str = Form(...),
+    method_code: str = Form(...),
+    connection_name: str = Form(...),
+    file: UploadFile = File(...),
+    environment: str = Form("DEV"),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        if environment not in {"DEV", "STAGING", "PROD"}:
+            raise ValueError("Environment must be DEV, STAGING, or PROD.")
+        content = await file.read()
+        if not content:
+            raise ValueError("The uploaded DSX file is empty.")
+        return await analyze_xml_upload(
+            session=session,
+            product_code=product_code,
+            method_code=method_code,
+            connection_name=connection_name,
+            environment=environment,
+            file_name=file.filename or "upload.dsx",
+            content=content,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "FAILED",
+                "stage": "DSX_VALIDATION",
+                "reason": str(exc),
+            },
+        ) from exc
 
 @router.post(
     "/discoveries",

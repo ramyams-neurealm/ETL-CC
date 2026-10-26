@@ -10,11 +10,11 @@
       "description": "Filter transactions where TXN_AMOUNT is greater than or equal to THRESHOLD_AMT. Generate ALERT_ID using ALRT_ plus TXN_ID. Copy CUSTOMER_ID and TXN_AMOUNT to target. Populate PROCESSED_ON with a deterministic processing date.",
       "unsupported_constructs": [],
       "parameters": [
-        {
-          "name": "PROC_DATE",
-          "parameter_type": "DATE",
-          "data_type": "DATE",
-          "default_value": "CURRENT_DATE",
+       {
+          "name": "THRESHOLD_AMT",
+          "parameter_type": "DECIMAL",
+          "data_type": "DECIMAL",
+          "default_value": "10000.00",
           "scope": "GRAPH"
         },
         {

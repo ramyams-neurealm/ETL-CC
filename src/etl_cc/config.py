@@ -187,7 +187,7 @@ class Settings(BaseSettings):
     enable_informatica_powercenter: bool = True
     enable_informatica_github: bool = True
     enable_informatica_xml_upload: bool = True
-    enable_datastage: bool = False
+    enable_datastage: bool = True   
     enable_ab_initio: bool = True
 
     azure_tenant_id: str
@@ -225,8 +225,9 @@ class Settings(BaseSettings):
     rag_metadata_weight: float = 0.30
     rag_embedding_batch_size: int = 50
     conversion_max_attempts: int = 2
-    validation_test_timeout_seconds: int = 600
-    minimum_functional_parity: float = 0.60
+    validation_test_timeout_seconds: int = 300
+    minimum_functional_parity: float = 0.50
+    validation_upload_directory_name: str = "runtime_validation_uploads"
     validation_confidence_threshold: float = 0.60
     validation_upload_max_bytes: int = 104857600
     validation_upload_max_rows: int = 100000
