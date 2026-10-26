@@ -164,7 +164,7 @@ class GitDeploymentAgent:
                 raise ValueError("Invalid artifact destination.")
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-            paths.append(target.relative_to(worktree).as_posix())
+            paths.append(target.relative_to(worktree.resolve()).as_posix())
         return paths
 
     def _write_manifest(self, context, verified, worktree, deployed_paths):
@@ -193,7 +193,7 @@ class GitDeploymentAgent:
          ],
      }
      manifest.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-     deployed_paths.append(manifest.relative_to(worktree).as_posix())
+     deployed_paths.append(manifest.relative_to(worktree.resolve()).as_posix())
     def _clone(self, remote, base, worktree, env):
         subprocess.run(["git","clone","--branch",base,"--single-branch",remote,str(worktree)],env=env,capture_output=True,text=True,check=True,timeout=180)
 
