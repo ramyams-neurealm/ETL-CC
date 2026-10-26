@@ -68,7 +68,8 @@ from etl_cc.security import (
     credential_cipher,
     verify_connection_test_token,
 )
-from etl_cc.source_store import create_source, load_manifest, update_manifest
+from etl_cc.source_store import create_source, create_source_package, load_manifest, update_manifest
+from etl_cc.xml_package import expand_uploads, merge_xml_files, object_summary
 
 
 SUPPORTED_SOURCE_SELECTIONS = {
@@ -1020,15 +1021,6 @@ async def get_migration_token_utilization(
     }
 
 
-def _public_validation_files(data_files: dict[str, Any] | None) -> dict[str, str]:
-    """Return safe filenames without exposing internal absolute server paths."""
-    return {
-        str(name): Path(str(path)).name
-        for name, path in (data_files or {}).items()
-        if path
-    }
-
-
 async def get_migration_dashboard(
     session: AsyncSession,
     migration_id: str,
@@ -1169,10 +1161,6 @@ async def get_migration_dashboard(
             "evidence": {
                 "test_cases": validation_payload.get("test_cases", []),
                 "stages": validation_payload.get("stages", []),
-                "data_files": _public_validation_files(
-                    validation_payload.get("data_files")
-                    or completion_payload.get("data_files")
-                ),
             },
             "event_log": mapping_events,
             "links": {

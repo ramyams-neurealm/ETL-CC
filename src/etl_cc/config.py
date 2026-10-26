@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = 2.0
     source_snapshot_ttl_seconds: int = 1800
     max_xml_upload_bytes: int = 26214400
+
+    # Multi-XML, workflow, session, and worklet package upload.
+    xml_package_max_files: int = 100
+    xml_package_max_file_bytes: int = 26214400
+    xml_package_max_total_bytes: int = 104857600
+    xml_package_allow_zip: bool = True
     memory_workspace_root: str = "/dev/shm/etl_cc"
 
     # Discovery capability flags exposed by GET /etl-products.
@@ -49,10 +55,19 @@ class Settings(BaseSettings):
 
     artifact_directory_name: str = "runtime_artifacts"
     rag_max_items: int = 8
+    rag_embedding_deployment: str = "text-embedding-3-small"
+    rag_embedding_dimensions: int = 1536
+    rag_candidate_count: int = 30
+    rag_min_vector_similarity: float = 0.50
+    rag_min_similarity: float = 0.65
+    rag_vector_weight: float = 0.70
+    rag_metadata_weight: float = 0.30
+    rag_embedding_batch_size: int = 50
     conversion_max_attempts: int = 2
     validation_test_timeout_seconds: int = 300
     minimum_functional_parity: float = 0.50
     validation_upload_directory_name: str = "runtime_validation_uploads"
+    validation_confidence_threshold: float = 0.60
     validation_upload_max_bytes: int = 104857600
     validation_upload_max_rows: int = 100000
     # Optional Discovery economics baselines. Economics remain NOT_CONFIGURED
@@ -102,11 +117,6 @@ class Settings(BaseSettings):
     @property
     def artifact_directory(self) -> Path:
         path = Path(self.artifact_directory_name)
-        return path if path.is_absolute() else PROJECT_ROOT / path
-
-    @property
-    def validation_upload_directory(self) -> Path:
-        path = Path(self.validation_upload_directory_name)
         return path if path.is_absolute() else PROJECT_ROOT / path
 
     @property

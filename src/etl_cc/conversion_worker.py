@@ -154,7 +154,6 @@ async def _audit_start(
         agent_name=agent.AGENT_NAME,
         stage_name=agent.STAGE_NAME,
         attempt_number=attempt,
-        request_payload=request_payload,
     )
     return audit
 
@@ -189,7 +188,8 @@ async def _audit_complete(
         model_name=audit.model_name,
         input_tokens=audit.input_tokens,
         output_tokens=audit.output_tokens,
-        response_payload=audit.response_payload,
+        status=audit.status,
+        result_summary=audit.response_payload,
     )
 
 
@@ -334,7 +334,13 @@ async def _process_mapping(
         {"mapping": mapping.mapping_name},
     )
     try:
-        rag = await rag_agent.run(session, mapping, repository.id)
+        rag = await rag_agent.run(
+            session,
+            mapping,
+            repository.id,
+            workflow_run_id=workflow.id,
+            etl_object_id=mapping_row.id,
+        )
         await _audit_complete(session, rag_audit, rag_agent, rag)
     except Exception as exc:
         await _audit_fail(session, rag_audit, exc, rag_agent)

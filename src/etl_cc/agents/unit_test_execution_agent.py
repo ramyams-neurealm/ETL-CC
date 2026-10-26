@@ -1,10 +1,12 @@
 """Safe pytest execution with one durable result per test function."""
 
+import ast
 import json
 import os
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +46,7 @@ class UnitTestExecutionResult(BaseModel):
 
 class UnitTestExecutionAgent:
     AGENT_NAME = "UNIT_TEST_EXECUTION_AGENT"
-    AGENT_VERSION = "2.1.0"
+    AGENT_VERSION = "2.2.0"
     STAGE_NAME = "UNIT_TEST_EXECUTION"
     MODEL_NAME = "DETERMINISTIC_PYTEST_JSON"
 
@@ -77,8 +79,18 @@ class UnitTestExecutionAgent:
                 evidence={"test_file": str(test_file)},
             )
 
-        report_path = test_file.parent / ".pytest-report.json"
-        report_path.unlink(missing_ok=True)
+        shape_errors = self._validate_create_dataframe_shapes(test_file)
+        if shape_errors:
+            return self._single_failure(
+                "; ".join(shape_errors),
+                evidence={
+                    "test_file": str(test_file),
+                    "preflight_check": "CREATE_DATAFRAME_ROW_SCHEMA_SHAPE",
+                },
+            )
+
+        report_directory = tempfile.TemporaryDirectory(prefix="neuflow-pytest-")
+        report_path = Path(report_directory.name) / "pytest-report.json"
 
         safe_env = self._build_safe_environment(test_file.parent)
         command = [
@@ -88,7 +100,7 @@ class UnitTestExecutionAgent:
             "-q",
             test_file.name,
             "--json-report",
-            f"--json-report-file={report_path.name}",
+            f"--json-report-file={report_path}",
         ]
 
         started = time.perf_counter()
@@ -177,7 +189,7 @@ class UnitTestExecutionAgent:
                 },
             )
         finally:
-            report_path.unlink(missing_ok=True)
+            report_directory.cleanup()
 
         cases: list[TestCaseResult] = []
         for index, item in enumerate(report.get("tests", []), start=1):
@@ -253,6 +265,66 @@ class UnitTestExecutionAgent:
             stdout=stdout[-10000:],
             stderr=stderr[-10000:],
         )
+
+    @staticmethod
+    def _validate_create_dataframe_shapes(test_file: Path) -> list[str]:
+        """Reject literal createDataFrame row/schema width mismatches."""
+        try:
+            tree = ast.parse(test_file.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, SyntaxError) as exc:
+            return [f"Unit-test preflight parsing failed: {type(exc).__name__}: {exc}"]
+
+        assignments: dict[str, ast.AST] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                if isinstance(node.targets[0], ast.Name):
+                    assignments[node.targets[0].id] = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if node.value is not None:
+                    assignments[node.target.id] = node.value
+
+        def resolve(node: ast.AST) -> ast.AST:
+            return assignments.get(node.id, node) if isinstance(node, ast.Name) else node
+
+        def schema_width(node: ast.AST) -> int | None:
+            node = resolve(node)
+            if not isinstance(node, ast.Call) or not node.args:
+                return None
+            name = node.func.id if isinstance(node.func, ast.Name) else (
+                node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            )
+            fields = resolve(node.args[0])
+            return len(fields.elts) if name == "StructType" and isinstance(fields, (ast.List, ast.Tuple)) else None
+
+        def row_widths(node: ast.AST) -> set[int] | None:
+            node = resolve(node)
+            if not isinstance(node, (ast.List, ast.Tuple)):
+                return None
+            widths: set[int] = set()
+            for row in node.elts:
+                row = resolve(row)
+                if not isinstance(row, (ast.List, ast.Tuple)):
+                    return None
+                widths.add(len(row.elts))
+            return widths
+
+        errors: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else (
+                node.func.id if isinstance(node.func, ast.Name) else ""
+            )
+            if name != "createDataFrame":
+                continue
+            widths = row_widths(node.args[0])
+            width = schema_width(node.args[1])
+            if widths is not None and width is not None and any(item != width for item in widths):
+                errors.append(
+                    "Generated UNIT_TEST is invalid: createDataFrame StructType "
+                    f"has {width} fields but row widths are {sorted(widths)}."
+                )
+        return errors
 
     @classmethod
     def _build_safe_environment(cls, test_directory: Path) -> dict[str, str]:
