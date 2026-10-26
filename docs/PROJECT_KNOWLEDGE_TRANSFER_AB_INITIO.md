@@ -23,7 +23,7 @@ The platform is implemented as an asynchronous FastAPI plus PostgreSQL plus work
 | Informatica PowerCenter connector | Implemented, requires `pmrep` |
 | Informatica XML upload | Implemented |
 | Informatica GitHub XML ingestion | Implemented, non-recursive directory listing |
-| Ab Initio ingestion | Implemented for normalized `AB_INITIO_GRAPH_JSON`, feature-flagged off by default |
+| Ab Initio ingestion | Implemented for `.mp` uploads containing the normalized `AB_INITIO_GRAPH_JSON` payload, feature-flagged off by default |
 | Discovery | Implemented in `worker.py` |
 | Lineage | Implemented with NetworkX |
 | Dependency planning | Implemented with NetworkX |
@@ -67,7 +67,7 @@ ETL-CC addresses this by creating a controlled migration pipeline with:
    - GitHub URL, branch, folder, and optional token.
 2. **Source files**
    - Informatica PowerCenter XML export.
-   - Portable Ab Initio graph JSON with `format == "AB_INITIO_GRAPH_JSON"`.
+   - Ab Initio `.mp` upload containing the portable JSON graph structure with `format == "AB_INITIO_GRAPH_JSON"`.
 3. **Scope**
    - Entire source repository or selected mapping/graph keys.
 4. **Migration options**

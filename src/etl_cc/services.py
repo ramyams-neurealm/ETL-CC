@@ -192,8 +192,8 @@ async def analyze_ab_initio_graph(
         request.method_code,
         "AB_INITIO_GRAPH_UPLOAD",
     )
-    if not file_name.lower().endswith(".json"):
-        raise ValueError("Only .json Ab Initio graph exports are accepted.")
+    if not file_name.lower().endswith(".mp"):
+        raise ValueError("Only .mp Ab Initio graph exports are accepted.")
     if not content:
         raise ValueError("The uploaded Ab Initio graph is empty.")
 

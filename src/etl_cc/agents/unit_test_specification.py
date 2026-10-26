@@ -112,12 +112,25 @@ class UnitTestSpecification(BaseModel):
 class UnitTestSpecificationValidator:
     """Validate LLM test semantics against canonical mapping metadata."""
 
-    VERSION = "1.5.0"
+    VERSION = "1.6.0"
     _CLOCK = re.compile(
         r"(?<![A-Za-z0-9_])(?:SYSDATE|SYSTIMESTAMP|CURRENT_TIMESTAMP|"
         r"CURRENT_DATE|LOCALTIMESTAMP|NOW(?:\s*\()?|GETDATE(?:\s*\()?)"
         r"(?![A-Za-z0-9_])",
         re.IGNORECASE,
+    )
+    _PURE_PARAMETER_EXPRESSIONS = (
+        re.compile(r"^\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*$", re.IGNORECASE),
+        re.compile(
+            r"^\s*CAST\s*\(\s*\$([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+"
+            r"(?:DATE|TIMESTAMP(?:\s*\([^)]*\))?)\s*\)\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:TO_DATE|TO_TIMESTAMP)\s*\(\s*"
+            r"\$([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*'[^']*'\s*)?\)\s*$",
+            re.IGNORECASE,
+        ),
     )
 
     @classmethod
@@ -355,6 +368,134 @@ class UnitTestSpecificationValidator:
                     f"{', '.join(undeclared_runtime)}."
                 )
         return errors
+
+    @classmethod
+    def repair_parameter_derived_runtime_columns(
+        cls,
+        specification: UnitTestSpecification,
+        mapping: CanonicalMapping,
+    ) -> None:
+        """Make clock-default parameters fixed inputs in generated test specs.
+
+        Some LLM responses classify a target field sourced directly from a
+        CURRENT_DATE/NOW-defaulted parameter as a runtime clock output. These
+        fields are deterministic once a scenario supplies a fixed parameter
+        value, so repair that representation before validation and rendering.
+        """
+        parameters = {
+            parameter.name.casefold(): parameter
+            for parameter in mapping.parameters
+        }
+        clock_parameters = {
+            parameter.name.casefold(): parameter
+            for parameter in mapping.parameters
+            if cls._CLOCK.search(str(parameter.default_value or ""))
+            and canonical_temporal_family(
+                parameter.data_type or parameter.parameter_type
+            )
+            is not None
+        }
+        if not clock_parameters:
+            return
+
+        ports = {
+            (transformation.name, port.name): port
+            for transformation in mapping.transformations
+            for port in transformation.ports
+        }
+        incoming: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for connector in mapping.connectors:
+            if connector.to_field and connector.from_field:
+                incoming.setdefault(
+                    (connector.to_instance, connector.to_field),
+                    [],
+                ).append((connector.from_instance, connector.from_field))
+
+        def parameter_origin(
+            node: tuple[str, str],
+            visited: set[tuple[str, str]],
+        ) -> str | None:
+            if node in visited:
+                return None
+            visited = {*visited, node}
+            port = ports.get(node)
+            if port is not None and port.expression:
+                expression = str(port.expression)
+                for pattern in cls._PURE_PARAMETER_EXPRESSIONS:
+                    match = pattern.fullmatch(expression)
+                    if match:
+                        parameter_name = match.group(1).casefold()
+                        if parameter_name in clock_parameters:
+                            return parameter_name
+                return None
+
+            origins = {
+                origin
+                for upstream in incoming.get(node, [])
+                if (origin := parameter_origin(upstream, visited)) is not None
+            }
+            return next(iter(origins)) if len(origins) == 1 else None
+
+        target_parameter_fields: dict[str, str] = {}
+        for target in mapping.targets:
+            for field in target.fields:
+                origin = parameter_origin((target.name, field.name), set())
+                if origin is not None:
+                    target_parameter_fields[field.name] = origin
+        if not target_parameter_fields:
+            return
+
+        for scenario in specification.scenarios:
+            supplied = {
+                item.parameter_name.casefold(): item
+                for item in scenario.parameter_values
+            }
+            for parameter_name in set(target_parameter_fields.values()):
+                parameter = parameters[parameter_name]
+                if parameter_name in supplied:
+                    continue
+                family = canonical_temporal_family(
+                    parameter.data_type or parameter.parameter_type
+                )
+                if family == "date":
+                    fixed_value = "2000-01-01"
+                elif family == "timestamp":
+                    fixed_value = "2000-01-01T00:00:00"
+                else:
+                    continue
+                value = ParameterValue(
+                    parameter_name=parameter.name,
+                    value=fixed_value,
+                )
+                scenario.parameter_values.append(value)
+                supplied[parameter_name] = value
+
+            deterministic = list(dict.fromkeys(scenario.deterministic_columns))
+            for field_name, parameter_name in target_parameter_fields.items():
+                if supplied.get(parameter_name) is not None and field_name not in deterministic:
+                    deterministic.append(field_name)
+            scenario.runtime_columns = [
+                item
+                for item in scenario.runtime_columns
+                if item.column_name not in target_parameter_fields
+            ]
+
+            expected_rows = []
+            for row in scenario.expected_rows:
+                cells = {cell.field_name: cell for cell in row.cells}
+                for field_name, parameter_name in target_parameter_fields.items():
+                    parameter_value = supplied.get(parameter_name)
+                    if parameter_value is None:
+                        continue
+                    cells[field_name] = TestCell(
+                        field_name=field_name,
+                        value=parameter_value.value,
+                    )
+                expected_rows.append(
+                    TestRow(cells=list(cells.values()))
+                )
+            scenario.expected_rows = expected_rows
+            scenario.deterministic_columns = deterministic
 
     @classmethod
     def runtime_fields(cls, mapping: CanonicalMapping) -> set[str]:

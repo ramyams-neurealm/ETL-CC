@@ -27,7 +27,7 @@ from etl_cc.agents.validation_agent import (
 from etl_cc.worker import _load_mappings
 
 
-FIXTURE = Path(__file__).parents[1] / "runtime_sources" / "ab_initio_graph" / "sample_ab_initio_graph.json"
+FIXTURE = Path(__file__).parents[1] / "runtime_sources" / "ab_initio_graph" / "sample_ab_initio_graph.mp"
 
 
 def test_ab_initio_fixture_maps_to_canonical_contract():

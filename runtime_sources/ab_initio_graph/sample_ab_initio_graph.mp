@@ -1,6 +1,7 @@
 {
   "format": "AB_INITIO_GRAPH_JSON",
   "format_version": "1.0",
+  "file_extension": ".mp",
   "project": "transactions",
   "graphs": [
     {

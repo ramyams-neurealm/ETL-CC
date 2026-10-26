@@ -393,7 +393,7 @@ async def analyze_ab_initio(
         return await analyze_ab_initio_graph(
             session,
             request,
-            file.filename or "ab_initio_graph.json",
+            file.filename or "ab_initio_graph.mp",
             await file.read(),
         )
     except ValueError as exc:

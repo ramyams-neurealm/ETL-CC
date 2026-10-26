@@ -201,7 +201,7 @@ class Settings(BaseSettings):
     openai_max_output_tokens: int | None = None
 
     # --- GLiNER Configuration ---
-    enable_gliner: bool = True
+    enable_gliner: bool = False
     gliner_model: str = "fastino/GLiNER2.5-Decide"
     gliner_auto_convert_threshold: float = 0.90
     # Added: the model runs as a small service on the Linux server and is

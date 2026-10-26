@@ -51,11 +51,11 @@ class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "3.1.0"
+    AGENT_VERSION = "3.3.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "ETL_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "3.1.0"
+    PROMPT_VERSION = "3.3.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
@@ -172,6 +172,8 @@ PYSPARK_CODE requirements:
   their exact canonical parameter names. Keep the transform pure: do not read
   dbutils, widgets, environment variables, or external state. The Databricks
   job wrapper supplies widget/job values in this dictionary.
+- Because parameters is optional, normalize it at the start of transform with
+  `parameters = parameters or {}` before calling `.get()` on it.
 - If a declared parameter has a CURRENT_DATE/NOW-style default, use its
   supplied value as a deterministic input. If it is not supplied, use the
   corresponding Spark clock expression, created once per transform invocation
@@ -191,6 +193,9 @@ PYSPARK_CODE requirements:
     parameter references as runtime behavior. Never replace them with a fixed
     calendar date or another time-dependent literal.
 - Select target columns explicitly in target-schema order.
+- Every selected output column must use its exact canonical target field name.
+  For example, select TXN_AMOUNT as ALERT_AMOUNT when the target schema names
+  that field ALERT_AMOUNT; never return the source name as a substitute.
 - A nullable field used in a filter follows normal Spark SQL three-valued
   semantics unless supplied evidence defines different null behavior. Do not
   invent an additional null rule merely because the field is nullable.
@@ -384,6 +389,10 @@ Rules:
                 previous_specification = None
                 continue
 
+            UnitTestSpecificationValidator.repair_parameter_derived_runtime_columns(
+                specification,
+                mapping,
+            )
             previous_specification = specification.model_dump(mode="json")
             repair_errors = UnitTestSpecificationValidator.validate(
                 specification,
@@ -645,6 +654,49 @@ Rules:
                     "transform must accept declared ETL parameters through an "
                     "optional keyword-only parameters dictionary."
                 )
+            if not self._normalizes_optional_parameters(transform_function):
+                errors.append(
+                    "transform must normalize its optional parameters dictionary "
+                    "with `parameters = parameters or {}` before using it."
+                )
+
+        if mapping:
+            target_fields = {
+                field.name
+                for target in mapping.targets
+                for field in target.fields
+            }
+            referenced_output_fields: set[str] = set()
+            for node in ast.walk(transform_function):
+                if not isinstance(node, ast.Call):
+                    continue
+                function_name = (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else ""
+                )
+                if function_name not in {
+                    "alias",
+                    "col",
+                    "select",
+                    "withColumn",
+                    "withColumnRenamed",
+                }:
+                    continue
+                referenced_output_fields.update(
+                    argument.value
+                    for argument in node.args
+                    if isinstance(argument, ast.Constant)
+                    and isinstance(argument.value, str)
+                )
+            missing_target_fields = sorted(target_fields - referenced_output_fields)
+            if missing_target_fields:
+                errors.append(
+                    "transform does not explicitly project canonical target "
+                    "field(s): " + ", ".join(missing_target_fields) + "."
+                )
 
         source_field_owners: dict[str, set[str]] = {}
         # The generated function must make duplicate source fields unambiguous.
@@ -681,6 +733,49 @@ Rules:
             break
 
         return errors
+
+    @staticmethod
+    def _normalizes_optional_parameters(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> bool:
+        """Require parameters=None to become an empty mapping before use."""
+        normalization_line: int | None = None
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(
+                isinstance(target, ast.Name) and target.id == "parameters"
+                for target in node.targets
+            ):
+                continue
+            value = node.value
+            if (
+                isinstance(value, ast.BoolOp)
+                and isinstance(value.op, ast.Or)
+                and len(value.values) == 2
+                and isinstance(value.values[0], ast.Name)
+                and value.values[0].id == "parameters"
+                and isinstance(value.values[1], ast.Dict)
+                and not value.values[1].keys
+            ):
+                normalization_line = node.lineno
+                break
+        if normalization_line is None:
+            return False
+
+        parameter_get_lines = [
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "parameters"
+        ]
+        return (
+            not parameter_get_lines
+            or normalization_line < min(parameter_get_lines)
+        )
 
     @staticmethod
     def _is_constant_assignment(node: ast.Assign | ast.AnnAssign) -> bool:

@@ -27,7 +27,7 @@ FIXTURE = (
     Path(__file__).parents[1]
     / "runtime_sources"
     / "ab_initio_graph"
-    / "sample_ab_initio_graph.json"
+    / "sample_ab_initio_graph.mp"
 )
 
 
@@ -100,7 +100,12 @@ def _specification(
 def test_retry_prompt_includes_exact_errors_and_previous_scenarios(monkeypatch):
     mapping = AbInitioGraphParser().parse_file(FIXTURE)[0]
     invalid = _specification(with_fixed_parameter=False, declares_runtime=True)
+    invalid.mapping_name = "invalid_mapping_name"
     valid = _specification(with_fixed_parameter=True, declares_runtime=False)
+    UnitTestSpecificationValidator.repair_parameter_derived_runtime_columns(
+        invalid,
+        mapping,
+    )
     expected_errors = UnitTestSpecificationValidator.validate(invalid, mapping)
     calls = []
 
@@ -159,6 +164,41 @@ def test_retry_prompt_includes_exact_errors_and_previous_scenarios(monkeypatch):
     assert retry_payload["previous_validation_errors"] == expected_errors
     assert retry_payload["previous_specification"]["scenarios"][0]["test_id"] == "UTS001"
     assert "parameters={'PROC_DATE': date.fromisoformat" in result.generated_files[1].content
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "$PROC_DATE",
+        "CAST($PROC_DATE AS DATE)",
+        "TO_DATE($PROC_DATE)",
+    ],
+)
+def test_false_runtime_declaration_for_parameter_output_is_repaired(expression):
+    mapping = AbInitioGraphParser().parse_file(FIXTURE)[0]
+    mapping.transformations[-1].ports[-1].expression = expression
+    specification = _specification(
+        with_fixed_parameter=False,
+        declares_runtime=True,
+    )
+
+    UnitTestSpecificationValidator.repair_parameter_derived_runtime_columns(
+        specification,
+        mapping,
+    )
+
+    scenario = specification.scenarios[0]
+    assert UnitTestSpecificationValidator.validate(specification, mapping) == []
+    assert scenario.runtime_columns == []
+    assert "PROCESSED_ON" in scenario.deterministic_columns
+    assert {
+        cell.field_name: cell.value
+        for cell in scenario.expected_rows[0].cells
+    }["PROCESSED_ON"] == "2000-01-01"
+    assert {
+        item.parameter_name: item.value
+        for item in scenario.parameter_values
+    }["PROC_DATE"] == "2000-01-01"
 
 
 def test_literal_date_is_expected_exactly_in_rendered_test():
