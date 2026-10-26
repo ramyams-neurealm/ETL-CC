@@ -694,6 +694,8 @@ class MappingDiscoveryDetailsResponse(BaseModel):
     migration_recommendations: list[str] = Field(default_factory=list)
     confidence: float | None
     human_review_required: bool
+    gliner_decision: str | None = None
+    gliner_confidence: float | None = None
     readiness_status: str
     discovery_status: str
     model_name: str | None
@@ -912,6 +914,9 @@ class ValidationReportResponse(BaseModel):
     passed_tests: int
     failed_tests: int
     skipped_tests: int
+    human_review_required: bool = False
+    gliner_uncertain: bool | None = None
+    gliner_confidence: float | None = None
     mappings: list[ValidationMappingResponse] = Field(default_factory=list)
 
 

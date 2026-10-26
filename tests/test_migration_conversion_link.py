@@ -47,7 +47,7 @@ class _Session:
         pass
 
 
-def test_start_conversion_links_to_requested_migration():
+def test_start_conversion_links_to_requested_migration(monkeypatch):
     parent = SimpleNamespace(
         workflow_id="MIG-1",
         job_type="MIGRATION",
@@ -55,6 +55,15 @@ def test_start_conversion_links_to_requested_migration():
         scope_payload={"etl_object_ids": [135]},
     )
     session = _Session(parent)
+    async def latest_discovery(*args, **kwargs):
+        return SimpleNamespace(
+            response_payload={"gliner_decision": "AUTO_CONVERT"}
+        )
+
+    monkeypatch.setattr(
+        "etl_cc.services._latest_agent_response",
+        latest_discovery,
+    )
     request = StartConversionRequest(
         repository_id=88,
         etl_object_ids=[135],

@@ -33,15 +33,29 @@ Swagger UI is exposed at:
 
 Before starting the app:
 
-1. Install Python dependencies:
+1. Install a JDK supported by the installed PySpark version and set `JAVA_HOME`.
+   In each PowerShell terminal that runs the API, orchestrator, or tests, add
+   the JDK `bin` directory to `PATH` and verify Java:
+
+```powershell
+$env:JAVA_HOME = 'C:\path\to\your\jdk'
+$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
+java -version
+```
+
+If `JAVA_HOME` is already set, keep its value and run only the `PATH` and
+verification commands. ETL-CC also adds an existing `JAVA_HOME\bin` to Spark
+child-process environments automatically.
+
+2. Install Python dependencies:
 
 ```powershell
 pip install -r requirements.txt
 ```
 
-2. Make sure the project root has a valid `.env` file with database and Azure/OpenAI settings.
+3. Make sure the project root has a valid `.env` file with database and Azure/OpenAI settings.
 
-3. Ensure the PostgreSQL database is running and reachable.
+4. Ensure the PostgreSQL database is running and reachable.
 
 ### 2.2 Start the API from VS Code
 
@@ -160,6 +174,21 @@ Discovery is the ingestion and mapping analysis phase.
 - `GET /api/v1/mappings/{etl_object_id}/conversion` — conversion info
 - `GET /api/v1/mappings/{etl_object_id}/artifacts` — generated artifacts
 - `GET /api/v1/artifacts/{artifact_id}` — artifact content
+
+Each mapping in the migration dashboard includes `agent_performance`,
+`economics`, and `quality` sections matching the corresponding conversion
+workbench metrics. These sections are scoped to that mapping's conversion
+workflow; `quality.coverage_status` remains `PENDING_VALIDATION` until a
+validation-specific coverage metric is available.
+
+Generated PySpark transformations accept the named source DataFrames and an
+optional keyword-only `parameters` dictionary. A Databricks job wrapper should
+read widget/job parameter values and pass them to
+`transform(inputs, parameters={...})`; the generated transform itself does not
+read `dbutils` or external state. Conversion unit tests provide fixed values for
+clock-default parameters and assert their outputs exactly. If a clock-default
+parameter is omitted at runtime, the transform uses the corresponding Spark
+clock expression.
 
 ### 4.5 Validation
 
@@ -372,7 +401,7 @@ uvicorn etl_cc.main:app --app-dir src --reload
 ```
 
 4. Open `http://127.0.0.1:8000/docs`
-5. If full background processing is required, open additional terminals and start the workers in this order:
+5. Start the discovery worker in a separate terminal when running discovery:
 
 ```powershell
 Set-Location 'c:/Users/viaan.sharma/ETL-CC'
@@ -380,23 +409,20 @@ $env:PYTHONPATH = 'src'
 python -m etl_cc.worker
 ```
 
-```powershell
-Set-Location 'c:/Users/viaan.sharma/ETL-CC'
-$env:PYTHONPATH = 'src'
-python -m etl_cc.conversion_worker
-```
+For migration conversion, validation, and deployment, start only the LangGraph
+orchestrator in its own terminal. Do not run the legacy conversion, validation,
+or deployment polling workers at the same time:
 
 ```powershell
 Set-Location 'c:/Users/viaan.sharma/ETL-CC'
 $env:PYTHONPATH = 'src'
-python -m etl_cc.validation_worker
+python -m etl_cc.langgraph_orchestrator
 ```
 
-```powershell
-Set-Location 'c:/Users/viaan.sharma/ETL-CC'
-$env:PYTHONPATH = 'src'
-python -m etl_cc.deployment_worker
-```
+If code changes were made while the orchestrator was running, stop it with
+`Ctrl+C` and start it again so it loads the updated code. Confirm the startup
+log reports `graph_version=2.1.0` and
+`unit_test_specification_version=1.4.0`.
 
 6. Test the endpoints in order.
 

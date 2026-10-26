@@ -15,6 +15,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
@@ -55,6 +56,7 @@ from etl_cc.models import (
     StartDeploymentRequest,
     StartDeploymentResponse,
     DeploymentMappingResponse,
+    WorkflowEventETL,
     DeploymentTargetResponse,
     GitHubDeploymentTargetTestRequest,
     GitHubDeploymentTargetTestResponse,
@@ -489,7 +491,26 @@ async def workflow_status(
     row = await get_workflow_by_external_id(session, workflow_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Workflow not found.")
-    return _workflow_payload(row)
+    payload = _workflow_payload(row)
+    failure_event = await session.scalar(
+        select(WorkflowEventETL)
+        .where(
+            WorkflowEventETL.workflow_run_id == row.id,
+            WorkflowEventETL.event_type == "WORKFLOW_FAILED",
+        )
+        .order_by(WorkflowEventETL.id.desc())
+        .limit(1)
+    )
+    failure_details = (
+        failure_event.event_payload if failure_event else {}
+    ) or {}
+    payload["failure_category"] = failure_details.get("failure_category")
+    payload["failure_suggested_step"] = failure_details.get(
+        "failure_suggested_step"
+    )
+    payload["gliner_decision"] = failure_details.get("gliner_decision")
+    payload["gliner_confidence"] = failure_details.get("gliner_confidence")
+    return payload
 
 
 @router.get("/workflows/{workflow_id}/events", tags=["Workflows"])

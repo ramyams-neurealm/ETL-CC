@@ -291,7 +291,9 @@ flowchart TD
 4. `ValidationAgent` performs:
    - artifact/static checks;
    - generated unit-test execution;
-   - synthetic test generation and schema validation;
+   - synthetic test generation and schema validation; comparison keys may
+     resolve through canonical connector and transformation-expression lineage
+     to a target field, including derived target keys;
    - deterministic reference-plan generation and validation;
    - relational reference execution;
    - generated PySpark target execution;

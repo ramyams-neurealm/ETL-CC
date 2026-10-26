@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -76,6 +77,12 @@ class RuntimeColumnExpectation(BaseModel):
     nullable: bool = False
 
 
+class ParameterValue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    parameter_name: str
+    value: str | int | float | bool | None = None
+
+
 class UnitTestScenario(BaseModel):
     model_config = ConfigDict(extra="forbid")
     test_id: str
@@ -92,6 +99,7 @@ class UnitTestScenario(BaseModel):
     expected_rows: list[TestRow]
     comparison_keys: list[str] = Field(min_length=1)
     deterministic_columns: list[str] = Field(min_length=1)
+    parameter_values: list[ParameterValue] = Field(default_factory=list)
     runtime_columns: list[RuntimeColumnExpectation] = Field(default_factory=list)
 
 
@@ -104,10 +112,11 @@ class UnitTestSpecification(BaseModel):
 class UnitTestSpecificationValidator:
     """Validate LLM test semantics against canonical mapping metadata."""
 
-    VERSION = "1.3.0"
+    VERSION = "1.5.0"
     _CLOCK = re.compile(
         r"(?<![A-Za-z0-9_])(?:SYSDATE|SYSTIMESTAMP|CURRENT_TIMESTAMP|"
-        r"CURRENT_DATE|LOCALTIMESTAMP|NOW\s*\(|GETDATE\s*\()(?![A-Za-z0-9_])",
+        r"CURRENT_DATE|LOCALTIMESTAMP|NOW(?:\s*\()?|GETDATE(?:\s*\()?)"
+        r"(?![A-Za-z0-9_])",
         re.IGNORECASE,
     )
 
@@ -130,6 +139,27 @@ class UnitTestSpecificationValidator:
             for target in mapping.targets
             for field in target.fields
         }
+        parameters = {
+            parameter.name.casefold(): parameter
+            for parameter in mapping.parameters
+        }
+        referenced_parameters = {
+            name.casefold()
+            for transformation in mapping.transformations
+            for port in transformation.ports
+            for name in re.findall(
+                r"\$([A-Za-z_][A-Za-z0-9_]*)",
+                str(port.expression or ""),
+            )
+        }
+        clock_default_parameters = {
+            parameter.name
+            for parameter in mapping.parameters
+            if (
+                parameter.name.casefold() in referenced_parameters
+                and cls._CLOCK.search(str(parameter.default_value or ""))
+            )
+        }
         runtime_fields = cls.runtime_fields(mapping)
         seen_ids: set[str] = set()
 
@@ -138,6 +168,63 @@ class UnitTestSpecificationValidator:
             if scenario.test_id in seen_ids:
                 errors.append(f"{prefix} duplicate test_id.")
             seen_ids.add(scenario.test_id)
+            parameter_names = [
+                item.parameter_name for item in scenario.parameter_values
+            ]
+            duplicate_parameters = sorted(
+                name
+                for name in set(parameter_names)
+                if parameter_names.count(name) > 1
+            )
+            unknown_parameters = sorted(
+                name
+                for name in parameter_names
+                if name.casefold() not in parameters
+            )
+            supplied_parameters = {name.casefold() for name in parameter_names}
+            missing_clock_parameters = sorted(
+                name
+                for name in clock_default_parameters
+                if name.casefold() not in supplied_parameters
+            )
+            if duplicate_parameters:
+                errors.append(
+                    f"{prefix} duplicate parameter value(s): "
+                    f"{', '.join(duplicate_parameters)}."
+                )
+            if unknown_parameters:
+                errors.append(
+                    f"{prefix} unknown parameter value(s): "
+                    f"{', '.join(unknown_parameters)}."
+                )
+            if missing_clock_parameters:
+                errors.append(
+                    f"{prefix} clock-default parameter(s) need fixed test values: "
+                    f"{', '.join(missing_clock_parameters)}."
+                )
+            for parameter_value in scenario.parameter_values:
+                parameter = parameters.get(parameter_value.parameter_name.casefold())
+                if parameter is None:
+                    continue
+                temporal_family = canonical_temporal_family(
+                    parameter.data_type or parameter.parameter_type
+                )
+                if temporal_family == "date":
+                    try:
+                        date.fromisoformat(str(parameter_value.value))
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"{prefix} parameter {parameter.name} must use an "
+                            "ISO date value."
+                        )
+                elif temporal_family == "timestamp":
+                    try:
+                        datetime.fromisoformat(str(parameter_value.value))
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"{prefix} parameter {parameter.name} must use an "
+                            "ISO timestamp value."
+                        )
 
             dataset_names = [item.dataset_name for item in scenario.input_datasets]
             duplicates = sorted(
@@ -271,12 +358,14 @@ class UnitTestSpecificationValidator:
 
     @classmethod
     def runtime_fields(cls, mapping: CanonicalMapping) -> set[str]:
-        """Resolve target fields backed by a nondeterministic clock expression.
+        """Resolve target fields backed by clock expressions in the mapping.
 
         Runtime expressions frequently pass through Filter, Router, Joiner, or
         other transformations before reaching a target. Classification must
         therefore follow connector lineage backwards instead of inspecting only
-        the final port or matching fields globally by name.
+        the final port or matching fields globally by name. A parameter default
+        is deliberately not treated as a clock expression: tests can supply a
+        fixed parameter value and assert its exact output.
         """
         transformations = {
             transformation.name: transformation
@@ -286,10 +375,6 @@ class UnitTestSpecificationValidator:
             (transformation.name, port.name): port
             for transformation in mapping.transformations
             for port in transformation.ports
-        }
-        parameter_defaults = {
-            parameter.name.casefold(): parameter.default_value
-            for parameter in mapping.parameters
         }
         incoming: dict[
             tuple[str, str],
@@ -320,17 +405,6 @@ class UnitTestSpecificationValidator:
                 expression = str(port.expression or "")
                 if cls._CLOCK.search(expression):
                     return True
-                parameter_names = re.findall(
-                    r"\$([A-Za-z_][A-Za-z0-9_]*)",
-                    expression,
-                )
-                if any(
-                    cls._CLOCK.search(
-                        str(parameter_defaults.get(name.casefold()) or "")
-                    )
-                    for name in parameter_names
-                ):
-                    return True
 
             # A pass-through transformation port has no expression. Continue
             # through every incoming connector for that exact instance/field.
@@ -349,29 +423,51 @@ class UnitTestSpecificationValidator:
                 if is_runtime_origin(target.name, field.name, set()):
                     runtime_targets.add(field.name)
 
-        # Preserve support for canonical mappings where a generated output is
-        # represented directly but connector-to-target metadata is unavailable.
-        if not mapping.connectors:
-            target_field_names = {
-                field.name
-                for target in mapping.targets
-                for field in target.fields
-            }
-            for transformation in transformations.values():
-                for port in transformation.ports:
-                    direction = str(port.direction or "").upper()
-                    if (
-                        port.name in target_field_names
-                        and direction
-                        in {
-                            "OUTPUT",
-                            "OUT",
-                            "INOUT",
-                            "INPUT/OUTPUT",
-                            "OUTPUT/INPUT",
-                        }
-                        and cls._CLOCK.search(str(port.expression or ""))
+        instance_edges: dict[str, set[str]] = {}
+        for connector in mapping.connectors:
+            instance_edges.setdefault(connector.from_instance, set()).add(
+                connector.to_instance
+            )
+
+        def reaches_target(start: str, target: str) -> bool:
+            pending = [start]
+            visited: set[str] = set()
+            while pending:
+                instance = pending.pop()
+                if instance == target:
+                    return True
+                if instance in visited:
+                    continue
+                visited.add(instance)
+                pending.extend(instance_edges.get(instance, set()) - visited)
+            return False
+
+        output_directions = {
+            "OUTPUT",
+            "OUT",
+            "INOUT",
+            "INPUT/OUTPUT",
+            "OUTPUT/INPUT",
+        }
+        for target in mapping.targets:
+            for field in target.fields:
+                target_node = (target.name, field.name)
+                if field.name in runtime_targets or incoming.get(target_node):
+                    continue
+                for transformation in transformations.values():
+                    if mapping.connectors and not reaches_target(
+                        transformation.name,
+                        target.name,
                     ):
-                        runtime_targets.add(port.name)
+                        continue
+                    for port in transformation.ports:
+                        if port.name != field.name or str(
+                            port.direction or ""
+                        ).upper() not in output_directions:
+                            continue
+                        expression = str(port.expression or "")
+                        if cls._CLOCK.search(expression):
+                            runtime_targets.add(field.name)
+                            break
 
         return runtime_targets

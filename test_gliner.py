@@ -1,22 +1,38 @@
-from etl_cc.gliner_service import gliner_service
+import json, sys, requests
 
-def run_gliner_tests():
-    print("--- Testing GLiNER Service ---")
-    
-    # 1. Test Failure Triage
-    print("\n1. Failure Triage Test:")
-    triage_res = gliner_service.triage_failure("Discovery", "Invalid token while connecting to repo")
-    print(triage_res)
+SUPPORTED = {"FILTER", "REFORMAT", "JOIN", "SORT", "ROLLUP", "DEDUP"}  # example list, replace with the project's real one
 
-    # 2. Test Discovery Routing
-    print("\n2. Discovery Routing Test:")
-    discovery_res = gliner_service.decide_discovery_routing("Complexity: LOW. Risky transformations: 0. Unsupported constructs: 0. Has cycle: False.")
-    print(discovery_res)
+def summarize(graph):
+    ds = graph["datasets"]
+    comps = graph.get("components", [])
+    types = [c["type"] for c in comps]
+    unsupported = [t for t in types if t not in SUPPORTED]
+    ports = [p for c in comps for p in c.get("ports", [])]
+    calls = sum(1 for p in ports if "(" in p.get("expression", ""))
+    joins = sum(1 for t in types if t == "JOIN")
+    return (
+        f"Mapping reads {len(ds['sources'])} source table and writes {len(ds['targets'])} target table. "
+        f"It has {len(comps)} components of types {', '.join(types)}. "
+        + ("All component types are standard and supported. " if not unsupported
+           else f"Unsupported component types: {', '.join(unsupported)}. ")
+        + f"{calls} output fields use a function call. "
+        + ("No joins. " if joins == 0 else f"{joins} joins. ")
+        + "No custom code."
+    )
 
-    # 3. Test Validation Routing
-    print("\n3. Validation Routing Test:")
-    validation_res = gliner_service.check_validation_uncertainty("Coverage: 95.0%. Oracle strength: STRONG. Checks passed: 12.")
-    print(validation_res)
+def main():
+    with open(sys.argv[1], encoding="utf-8") as source_file:
+        data = json.load(source_file)
+    for graph in data["graphs"]:
+        summary = summarize(graph)
+        print(graph["name"], "\nSUMMARY:", summary)
+        response = requests.post(
+            "http://127.0.0.1:8100/decide",
+            json={"text": summary},
+            timeout=30,
+        )
+        print("DECISION:", response.json())
+
 
 if __name__ == "__main__":
-    run_gliner_tests()
+    main()

@@ -650,6 +650,17 @@ async def _fail(workflow_id: int, exc: Exception) -> None:
         workflow = await session.get(WorkflowRunETL, workflow_id)
         if workflow is None:
             return
+        mapping_ids = workflow.scope_payload.get("etl_object_ids", [])
+        if mapping_ids:
+            mappings = await session.scalars(
+                select(ETLObjectETL).where(
+                    ETLObjectETL.id.in_(mapping_ids),
+                    ETLObjectETL.repository_id == workflow.repository_id,
+                    ETLObjectETL.migration_status == "VALIDATING",
+                )
+            )
+            for mapping in mappings:
+                mapping.migration_status = "VALIDATION_FAILED"
         workflow.current_stage = "VALIDATION"
         workflow.job_status = "FAILED"
         workflow.overall_status = "FAILED"

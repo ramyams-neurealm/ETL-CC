@@ -17,6 +17,7 @@ from etl_cc.database import SessionFactory
 from etl_cc.logging_config import configure_logging, log_event, log_exception
 from etl_cc.models import WorkflowRunETL
 from etl_cc import conversion_service, validation_service, deployment_service
+from etl_cc.agents.unit_test_specification import UnitTestSpecificationValidator
 
 logger = configure_logging("LANGGRAPH_ORCHESTRATOR")
 
@@ -154,7 +155,13 @@ async def claim_migration() -> MigrationState | None:
 
 
 async def run_orchestrator() -> None:
-    log_event(logger,"LANGGRAPH_ORCHESTRATOR_STARTED",graph="MIGRATION_GRAPH",graph_version="2.0.0")
+    log_event(
+        logger,
+        "LANGGRAPH_ORCHESTRATOR_STARTED",
+        graph="MIGRATION_GRAPH",
+        graph_version="2.1.0",
+        unit_test_specification_version=UnitTestSpecificationValidator.VERSION,
+    )
     while True:
         state=await claim_migration()
         if state is None:

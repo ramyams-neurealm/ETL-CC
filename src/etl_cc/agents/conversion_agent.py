@@ -51,11 +51,11 @@ class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "3.0.0"
+    AGENT_VERSION = "3.1.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
-    PROMPT_NAME = "INFORMATICA_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "3.0.0"
+    PROMPT_NAME = "ETL_TO_DATABRICKS_PYSPARK"
+    PROMPT_VERSION = "3.1.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
@@ -140,7 +140,14 @@ class ConversionAgent:
                 "generated_code_contract": {
                     "input": "A dict[str, pyspark.sql.DataFrame] keyed by canonical source dataset name",
                     "output": "One pyspark.sql.DataFrame",
-                    "signature": "def transform(inputs: dict[str, DataFrame]) -> DataFrame",
+                    "signature": (
+                        "def transform(inputs: dict[str, DataFrame], *, "
+                        "parameters: dict[str, Any] | None = None) -> DataFrame"
+                    ),
+                    "parameters": [
+                        item.model_dump(mode="json")
+                        for item in mapping.parameters
+                    ],
                 },
             },
         }
@@ -148,7 +155,7 @@ class ConversionAgent:
         system_prompt = """
 You are the Conversion Agent for an ETL migration system.
 
-Convert exactly one supplied Informatica Canonical Mapping into
+Convert exactly one supplied canonical ETL Mapping into
 validation-friendly Databricks PySpark. Use only supplied evidence. Do not
 invent fields, datasets, rules, expressions, parameters, connections, formats,
 locations, write modes, merge keys, partition columns, or runtime behavior.
@@ -158,7 +165,17 @@ CONFIGURATION file.
 
 PYSPARK_CODE requirements:
 - Define exactly one public function named transform.
-- Use: def transform(inputs: dict[str, DataFrame]) -> DataFrame.
+- Use: def transform(inputs: dict[str, DataFrame], *,
+  parameters: dict[str, Any] | None = None) -> DataFrame.
+- Import Any from typing when using this signature.
+- Resolve declared ETL parameters from the optional parameters dictionary by
+  their exact canonical parameter names. Keep the transform pure: do not read
+  dbutils, widgets, environment variables, or external state. The Databricks
+  job wrapper supplies widget/job values in this dictionary.
+- If a declared parameter has a CURRENT_DATE/NOW-style default, use its
+  supplied value as a deterministic input. If it is not supplied, use the
+  corresponding Spark clock expression, created once per transform invocation
+  and reused. Convert supplied temporal values with F.lit(value).cast(...).
 - The dictionary keys must be the exact canonical source dataset names supplied in evidence.
 - Resolve each source independently, for example: customers_df = inputs["SRC_CUSTOMERS"].
 - Implement joins and lookups between the named DataFrames. Never assume that multiple sources are pre-flattened.
@@ -190,7 +207,7 @@ PYSPARK_CODE requirements:
 
 UNIT_TEST requirements:
 - Use pytest.
-- Import transform from the generated module and call transform(inputs), where inputs is keyed by exact canonical source dataset names.
+- Import transform from the generated module and call transform(inputs), where inputs is keyed by exact canonical source dataset names. When the specification provides parameter_values, pass them as transform(inputs, parameters={...}).
 - Create a local SparkSession only inside a pytest fixture and stop it during
   fixture cleanup.
 - Use in-memory DataFrames.
@@ -287,16 +304,22 @@ Return only the requested structured output.
         pyspark_file = pyspark_files[0]
         unit_test_file = unit_test_files[0]
         repair_errors: list[str] = []
+        previous_specification: dict[str, Any] | None = None
         max_attempts = int(
             getattr(settings, "unit_test_specification_max_attempts", 3)
         )
 
         system_prompt = """
 You generate a structured, mapping-specific unit-test specification for an
-Informatica-to-PySpark conversion. Do not generate Python or Pytest code.
+ETL-to-PySpark conversion. Do not generate Python or Pytest code.
 Generate scenarios and typed JSON-compatible data only.
 
 Rules:
+- If previous_validation_errors is non-empty, fix every exact error. Use the
+  scenario IDs in those errors to identify and repair the affected scenarios
+  in previous_specification; preserve valid unaffected scenarios.
+- Do not repeat a prior invalid runtime_columns declaration or omit a required
+  fixed parameter value.
 - Use exact canonical source dataset and field names.
 - Include every canonical source dataset exactly once in every scenario.
 - input_datasets is a list. Each item has dataset_name and rows. Each row is a
@@ -308,11 +331,16 @@ Rules:
   boundary, negative, join, lookup, aggregation, or routing cases only when
   applicable to this mapping.
 - comparison_keys must be stable deterministic target fields.
-- deterministic_columns must exclude outputs driven by SYSDATE,
-  SYSTIMESTAMP, CURRENT_TIMESTAMP, CURRENT_DATE, LOCALTIMESTAMP, NOW(), or
-  GETDATE().
-- Declare every such nondeterministic output in runtime_columns with its type
-  and nullability.
+- Treat parameters with clock-expression defaults as deterministic test inputs:
+  provide a fixed, valid parameter_values entry in each scenario and assert
+  derived target values exactly.
+- Only columns whose transformation expressions themselves contain clock
+  expressions such as SYSDATE, SYSTIMESTAMP, CURRENT_TIMESTAMP, CURRENT_DATE,
+  LOCALTIMESTAMP, NOW(), or GETDATE() are runtime_columns. This includes
+  wrapped forms such as CAST, DATE_FORMAT, TO_DATE, and F.expr(...).
+- Exclude truly clock-derived outputs from deterministic_columns and expected
+  values; declare each in runtime_columns with its type and nullability so the
+  rendered test checks its existence, type, and non-null behavior instead.
 - expected_rows must contain every deterministic column for every row.
 - Apply the complete canonical operation sequence when deriving expected_rows.
 - Do not invent datasets, fields, transformations, or business rules.
@@ -329,6 +357,7 @@ Rules:
                 "discovery_and_rag_evidence": evidence,
                 "attempt": attempt,
                 "previous_validation_errors": repair_errors,
+                "previous_specification": previous_specification,
             }
             llm = DynamicChatOpenAI(
                 operation_name=(
@@ -352,8 +381,10 @@ Rules:
             self._capture_usage(raw)
             if specification is None:
                 repair_errors = ["No valid structured test specification was returned."]
+                previous_specification = None
                 continue
 
+            previous_specification = specification.model_dump(mode="json")
             repair_errors = UnitTestSpecificationValidator.validate(
                 specification,
                 mapping,
@@ -455,6 +486,15 @@ Rules:
             configuration["runtime"] = runtime
         runtime.setdefault("target_platform", "DATABRICKS")
         runtime.setdefault("target_framework", "PYSPARK")
+        runtime["parameters"] = [
+            {
+                "name": item.name,
+                "data_type": item.data_type or item.parameter_type,
+                "default_value": item.default_value,
+                "scope": item.scope,
+            }
+            for item in mapping.parameters
+        ]
         if not isinstance(configuration.get("manual_actions"), list):
             configuration["manual_actions"] = list(result.manual_actions)
 
@@ -511,7 +551,9 @@ Rules:
 
         errors.extend(self._validate_python_syntax(pyspark_file))
         errors.extend(self._validate_python_syntax(unit_test_file))
-        errors.extend(self._validate_pyspark_contract(pyspark_file.content))
+        errors.extend(
+            self._validate_pyspark_contract(pyspark_file.content, mapping)
+        )
         errors.extend(
             self._validate_unit_test_contract(
                 unit_test_file.content,
@@ -540,7 +582,11 @@ Rules:
             )
         return errors
 
-    def _validate_pyspark_contract(self, content: str) -> list[str]:
+    def _validate_pyspark_contract(
+        self,
+        content: str,
+        mapping: CanonicalMapping | None = None,
+    ) -> list[str]:
         errors: list[str] = []
         lowered = content.lower()
 
@@ -575,6 +621,30 @@ Rules:
             errors.append(
                 "transform must accept exactly one positional named-input dictionary argument."
             )
+        if mapping and mapping.parameters:
+            parameter_arguments = [
+                index
+                for index, argument in enumerate(
+                    transform_function.args.kwonlyargs
+                )
+                if argument.arg == "parameters"
+            ]
+            if (
+                len(parameter_arguments) != 1
+                or not isinstance(
+                    transform_function.args.kw_defaults[
+                        parameter_arguments[0]
+                    ],
+                    ast.Constant,
+                )
+                or transform_function.args.kw_defaults[
+                    parameter_arguments[0]
+                ].value is not None
+            ):
+                errors.append(
+                    "transform must accept declared ETL parameters through an "
+                    "optional keyword-only parameters dictionary."
+                )
 
         source_field_owners: dict[str, set[str]] = {}
         # The generated function must make duplicate source fields unambiguous.
