@@ -13,6 +13,17 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+def normalize_java_home(java_home: str | None) -> str | None:
+    """Normalize JAVA_HOME when callers provide the JDK's bin directory."""
+    if not java_home:
+        return java_home
+    normalized = java_home.strip().strip('"').strip("'")
+    java_home_path = Path(normalized).expanduser()
+    if java_home_path.name.lower() == "bin":
+        return str(java_home_path.parent)
+    return normalized
+
+
 class TestCaseResult(BaseModel):
     test_id: str
     category: str = "UNIT_TEST"
@@ -322,6 +333,9 @@ class UnitTestExecutionAgent:
             for key, value in os.environ.items()
             if key.upper() in cls._ALLOWED_ENVIRONMENT_KEYS
         }
+        java_home = safe_env.get("JAVA_HOME")
+        if java_home:
+            safe_env["JAVA_HOME"] = normalize_java_home(java_home) or java_home
         existing_python_path = os.environ.get("PYTHONPATH", "")
         python_path_parts = [str(test_directory)]
         if existing_python_path:

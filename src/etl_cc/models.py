@@ -27,7 +27,7 @@ from etl_cc.database import Base
 
 ETL_SCHEMA = settings.pg_schema
 ProductCode = Literal["INFORMATICA", "DATASTAGE", "AB_INITIO"]
-MethodCode = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+MethodCode = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD", "DSX_UPLOAD"]
 ConnectionType = MethodCode
 EnvironmentType = Literal["DEV", "STAGING", "PROD"]
 
@@ -145,7 +145,7 @@ class RepositoryETL(Base):
             name="uq_repository_etl_name_environment",
         ),
         CheckConstraint(
-            "connection_type IN ('POWERCENTER', 'GITHUB', 'XML_UPLOAD')",
+            "connection_type IN ('POWERCENTER', 'GITHUB', 'XML_UPLOAD', 'DSX_UPLOAD')",
             name="ck_repository_etl_connection_type",
         ),
         Index("ix_repository_etl_connection_type", "connection_type"),
@@ -1000,7 +1000,7 @@ class DeploymentMappingResponse(BaseModel):
 
 
 class ETLIngestionMethodResponse(BaseModel):
-    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD", "DSX_UPLOAD"]
     method_name: str
     description: str
     enabled: bool

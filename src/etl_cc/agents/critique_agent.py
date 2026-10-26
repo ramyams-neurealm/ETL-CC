@@ -36,15 +36,23 @@ class CritiqueResult(BaseModel):
 
 class CritiqueAgent:
     AGENT_NAME = "CRITIQUE_AGENT"
-    AGENT_VERSION = "1.2.0"
+    AGENT_VERSION = "1.4.0"
     STAGE_NAME = "CONVERSION_CRITIQUE"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "PYSPARK_CONVERSION_CRITIQUE"
-    PROMPT_VERSION = "1.2.0"
+    PROMPT_VERSION = "1.5.0"
 
-    def __init__(self) -> None:
+    UNIT_TEST_SEMANTICS_GUIDANCE = """Review UNIT_TEST expected rows against the complete canonical operation sequence, not just the generated PySpark. For AGGREGATE/GROUP BY, Spark retains null grouping keys as a null-key group unless canonical upstream evidence explicitly filters them out. SUM ignores null measure values within a group but does not remove the group; an all-null group has a null SUM. A unit-test expectation that drops a null-key group without a grounded exclusion rule is a HIGH severity UNIT_TEST_SEMANTICS issue and requires revision."""
+    UNIT_TEST_DECIMAL_GUIDANCE = """Review expected test value types against the canonical target schema. Spark returns DecimalType values as decimal.Decimal; expected decimal outputs must use Decimal from a string, never a float literal. A DecimalType assertion comparing a collected Decimal to a float is a HIGH severity UNIT_TEST_NUMERIC_TYPE issue and requires revision."""
+
+    def __init__(self, source_vendor: str = "INFORMATICA") -> None:
+        self.source_vendor = source_vendor
         self.model_name = self.MODEL_NAME
-        self.prompt_name = self.PROMPT_NAME
+        self.prompt_name = (
+            self.PROMPT_NAME
+            if source_vendor.upper().startswith("INFORMATICA")
+            else f"{source_vendor.upper()}_{self.PROMPT_NAME}"
+        )
         self.prompt_version = self.PROMPT_VERSION
         self.input_tokens = 0
         self.output_tokens = 0
@@ -65,10 +73,20 @@ class CritiqueAgent:
             "conversion": conversion.model_dump(mode="json"),
             "deterministic_checks": [item.model_dump() for item in checks],
         }
-        prompt = """Review generated Databricks PySpark against supplied
-Informatica evidence. Never invent requirements. Treat failed deterministic
+        vendor_guidance = ""
+        if self.source_vendor.upper().startswith("DATASTAGE"):
+            vendor_guidance = """
+    DataStage-specific review:
+    - Treat canonical source/target schemas and stage links as authoritative.
+    - Stage inventory and OLEType identify components but do not establish source/target direction or data flow.
+    - Flag unsupported or ambiguous DataStage properties for manual review; do not infer behavior from stage names.
+    """.strip()
+        prompt = f"""Review generated Databricks PySpark against supplied
+    {self.source_vendor} evidence. Never invent requirements. Treat failed deterministic
 checks, missing grounded business rules, missing canonical target fields,
 syntax errors, secrets, TODOs, or placeholders as requiring revision.
+
+    {vendor_guidance}
 
 Field-role rules:
 - Require final projection only for canonical target fields.
@@ -78,6 +96,8 @@ Field-role rules:
 - Spark filter predicates already exclude rows where the predicate evaluates
   to null. Do not require an explicit isNotNull check unless supplied canonical
   evidence defines a distinct null-handling rule.
+- {self.UNIT_TEST_SEMANTICS_GUIDANCE}
+- {self.UNIT_TEST_DECIMAL_GUIDANCE}
 - Do not recommend logging or projecting intermediate fields merely to improve
   lineage coverage.
 Return structured critique only."""
@@ -160,6 +180,15 @@ Return structured critique only."""
                 "NULL" in text
                 and bool(fields_used_in_code)
                 and not explicit_null_required
+                and not any(
+                    marker in text
+                    for marker in (
+                        "UNIT_TEST",
+                        "EXPECTED ROW",
+                        "TEST EXPECTATION",
+                        "ASSERTION",
+                    )
+                )
             )
             projection_only_finding = (
                 bool(non_target_fields)

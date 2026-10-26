@@ -1,4 +1,4 @@
-"""GPT-4o conversion agent for Informatica-to-Databricks PySpark migration."""
+"""GPT-4o conversion agent for ETL-to-Databricks PySpark migration."""
 
 import ast
 import json
@@ -44,6 +44,8 @@ class ConversionOutputValidationError(RuntimeError):
     """Raised when generated artifacts violate the conversion contract."""
 
 
+class ConversionInputValidationError(ValueError):
+    """Raised when canonical source evidence is insufficient for conversion."""
 logger = configure_logging("CONVERSION_AGENT")
 
 
@@ -51,17 +53,20 @@ class ConversionAgent:
     """Generate validation-friendly Databricks PySpark artifacts."""
 
     AGENT_NAME = "CONVERSION_AGENT"
-    AGENT_VERSION = "3.0.0"
+    AGENT_VERSION = "2.7.0"
     STAGE_NAME = "CODE_CONVERSION"
     MODEL_NAME = "gpt-4o"
     PROMPT_NAME = "INFORMATICA_TO_DATABRICKS_PYSPARK"
-    PROMPT_VERSION = "3.0.0"
+    PROMPT_VERSION = "2.7.0"
 
     REQUIRED_ARTIFACT_TYPES = {
         "PYSPARK_CODE",
         "UNIT_TEST",
         "CONFIGURATION",
     }
+
+    UNIT_TEST_SEMANTICS_GUIDANCE = """For AGGREGATE/GROUP BY operations, Spark retains rows with null grouping keys as a null-key group unless canonical upstream evidence explicitly filters them out. SUM ignores null measure values within a group; it does not remove the group. A group whose measure values are all null produces a null SUM. Unit-test expected rows must follow these semantics and the complete canonical operation sequence. Mark a row absent only when grounded filter, route, join, or other canonical behavior excludes it; null or boundary input alone is not grounds for exclusion."""
+    UNIT_TEST_DECIMAL_GUIDANCE = """For every DecimalType output, expected test values must be decimal.Decimal values constructed from strings (for example Decimal('9999999999.99')), not float literals. Spark collects DecimalType columns as Decimal; comparing a large Decimal to a float can fail because the float is inexact. Do not cast collected Decimal outputs to float to make an assertion pass."""
 
     FORBIDDEN_PYSPARK_PATTERNS = {
         "SparkSession.builder": "Generated mapping creates a SparkSession.",
@@ -101,9 +106,14 @@ class ConversionAgent:
         "jdbc_url",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, source_vendor: str = "INFORMATICA") -> None:
+        self.source_vendor = source_vendor
         self.model_name = self.MODEL_NAME
-        self.prompt_name = self.PROMPT_NAME
+        self.prompt_name = (
+            self.PROMPT_NAME
+            if source_vendor.upper().startswith("INFORMATICA")
+            else f"{source_vendor.upper()}_TO_DATABRICKS_PYSPARK"
+        )
         self.prompt_version = self.PROMPT_VERSION
         self.input_tokens = 0
         self.output_tokens = 0
@@ -119,7 +129,7 @@ class ConversionAgent:
         critique_feedback: list[dict[str, Any]] | None = None,
     ) -> ConversionResult:
         """Generate and validate one conversion result."""
-        stage_started(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name, sources=len(mapping.sources), targets=len(mapping.targets), transformations=len(mapping.transformations))
+        self._validate_mapping_readiness(mapping)
 
         evidence = {
             "canonical_mapping": mapping.model_dump(mode="json"),
@@ -145,10 +155,23 @@ class ConversionAgent:
             },
         }
 
-        system_prompt = """
+        vendor_guidance = ""
+        if self.source_vendor.upper().startswith("DATASTAGE"):
+            vendor_guidance = """
+    DATASTAGE DSX RULES:
+    - Use canonical sources, targets, connectors, transformations, and ports as the only executable mapping evidence.
+    - Treat source_metadata.stage_inventory as component inventory only. It does not define a dataset schema or prove connector direction.
+    - Never infer source or target roles from component names such as SRC_* or TGT_* or from an OLEType such as OracleConnector.
+    - Convert only expressions present in canonical transformation ports. Stage names and OLEType values alone do not define business logic.
+    - Surface unsupported or ambiguous DataStage properties as manual_actions; do not invent connector behavior, schemas, or field mappings.
+    """.strip()
+
+        system_prompt = f"""
 You are the Conversion Agent for an ETL migration system.
 
-Convert exactly one supplied Informatica Canonical Mapping into
+    {vendor_guidance}
+
+Convert exactly one supplied {self.source_vendor} Canonical Mapping into
 validation-friendly Databricks PySpark. Use only supplied evidence. Do not
 invent fields, datasets, rules, expressions, parameters, connections, formats,
 locations, write modes, merge keys, partition columns, or runtime behavior.
@@ -193,6 +216,8 @@ UNIT_TEST requirements:
 - Use in-memory DataFrames.
 - Cover happy path, applicable null handling, relevant boundary behavior, and
   every grounded business rule.
+- {self.UNIT_TEST_SEMANTICS_GUIDANCE}
+- {self.UNIT_TEST_DECIMAL_GUIDANCE}
 - Use decimal.Decimal values when DecimalType is used.
 - Do not connect to databases, use network calls, read or write external files,
   include credentials, or duplicate the transformation logic in the test.
@@ -219,7 +244,7 @@ UNIT_TEST data requirements:
 - Use datetime.datetime for timestamp fields, datetime.date for date fields, and Decimal from strings for decimal fields.
 - Never place pyspark.sql.Column expressions such as F.lit, F.to_timestamp, or F.to_date inside Python row tuples or dictionaries.
 - Compute expected rows by applying the complete canonical operation sequence: joins, derivations, filters, routing, aggregation, renames, and final projection.
-- Never include an expected output row that fails a canonical FILTER or ROUTE predicate. Negative and boundary inputs must be asserted as absent from output.
+- Never include an expected output row that fails a canonical FILTER or ROUTE predicate. Assert negative or boundary inputs absent only when canonical behavior explicitly excludes them; do not treat null or boundary inputs as implicitly rejected.
 - Prefer assertions keyed by deterministic target fields rather than full-row equality when runtime-generated timestamps are present.
 - Every createDataFrame(data, schema) call must use rows whose tuple/list length exactly matches the StructType field count.
 - For nondeterministic clock outputs such as SYSDATE, SYSTIMESTAMP, CURRENT_TIMESTAMP, CURRENT_DATE, NOW(), GETDATE(), or LOCALTIMESTAMP, do not add the runtime column to an expected StructType unless every expected row contains a concrete Python datetime value for that field.
@@ -263,6 +288,30 @@ Return only the requested structured output.
         stage_completed(logger, "CONVERSION_AGENT", mapping=mapping.mapping_name)
         return parsed
 
+    def _validate_mapping_readiness(self, mapping: CanonicalMapping) -> None:
+        """Require complete source evidence before converting a DataStage job."""
+        if not mapping.source_vendor.upper().startswith("DATASTAGE"):
+            return
+
+        missing: list[str] = []
+        if not mapping.sources:
+            missing.append("source datasets")
+        if not mapping.targets:
+            missing.append("target datasets")
+        if not mapping.connectors:
+            missing.append("DSX stage links")
+        if any(not dataset.fields for dataset in mapping.sources):
+            missing.append("source field schemas")
+        if any(not dataset.fields for dataset in mapping.targets):
+            missing.append("target field schemas")
+
+        if missing:
+            raise ConversionInputValidationError(
+                "DataStage mapping is not ready for conversion; missing "
+                + ", ".join(missing)
+                + ". Re-export or complete the DSX mapping metadata before "
+                "requesting conversion."
+            )
     async def _replace_unit_test_with_rendered_specification(
         self,
         result: ConversionResult,

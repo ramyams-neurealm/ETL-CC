@@ -90,8 +90,9 @@ class GitDeploymentAgent:
             verified = self._verify_artifacts(context.artifacts)
             stages.append(DeploymentStage(stage_name="ARTIFACT_INTEGRITY", status="COMPLETED", details="Artifact files and SHA-256 hashes are valid.", evidence={"artifact_count": len(verified)}))
             with tempfile.TemporaryDirectory(prefix="neuflow-git-deploy-") as temp:
-                worktree = Path(temp) / "repository"
-                env, askpass = self._git_environment(context.access_token, Path(temp))
+                temp_dir = Path(temp).resolve()
+                worktree = (temp_dir / "repository").resolve()
+                env, askpass = self._git_environment(context.access_token, temp_dir)
                 self._clone(context.remote_url, context.base_branch, worktree, env)
                 stages.append(DeploymentStage(stage_name="GIT_CLONE", status="COMPLETED", details=f"Cloned base branch {context.base_branch}."))
                 self._run_git(["checkout", "-B", context.branch_name], worktree, env)
@@ -159,23 +160,48 @@ class GitDeploymentAgent:
         return result
 
     def _copy_artifacts(self, context, verified, worktree):
-        root=(worktree/context.repository_path/self._safe(context.mapping_name)).resolve()
-        if worktree.resolve() not in root.parents: raise ValueError("Invalid deployment destination.")
-        paths=[]
+        worktree = worktree.resolve()
+        root = (worktree / context.repository_path / self._safe(context.mapping_name)).resolve()
+        if worktree not in root.parents:
+            raise ValueError("Invalid deployment destination.")
+        paths = []
         for artifact, source in verified:
-            folder=self.TYPE_DIRECTORIES[artifact.artifact_type]
-            target=(root/folder/Path(artifact.file_name).name).resolve()
-            if root not in target.parents: raise ValueError("Invalid artifact destination.")
-            target.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(source,target)
-            paths.append(target.relative_to(worktree).as_posix())
+            folder = self.TYPE_DIRECTORIES[artifact.artifact_type]
+            target = (root / folder / Path(artifact.file_name).name).resolve()
+            if root not in target.parents:
+                raise ValueError("Invalid artifact destination.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            paths.append(target.relative_to(worktree.resolve()).as_posix())
         return paths
 
     def _write_manifest(self, context, verified, worktree, deployed_paths):
-        root=worktree/context.repository_path/self._safe(context.mapping_name)
-        manifest=root/"metadata"/"deployment_manifest.json"; manifest.parent.mkdir(parents=True,exist_ok=True)
-        payload={"workflow_id":context.workflow_id,"validation_workflow_id":context.validation_workflow_id,"repository_id":context.repository_id,"mapping_id":context.mapping_id,"mapping_name":context.mapping_name,"deployed_at":datetime.now(timezone.utc).isoformat(),"branch_name":context.branch_name,"validation_evidence":context.validation_evidence,"artifacts":[{"artifact_id":a.artifact_id,"artifact_type":a.artifact_type,"file_name":a.file_name,"content_hash":a.content_hash,"git_path":p} for (a,_),p in zip(verified,deployed_paths,strict=True)]}
-        manifest.write_text(json.dumps(payload,indent=2,sort_keys=True),encoding="utf-8"); deployed_paths.append(manifest.relative_to(worktree).as_posix())
-
+     worktree = worktree.resolve()
+     root = (worktree / context.repository_path / self._safe(context.mapping_name)).resolve()
+     manifest = (root / "metadata" / "deployment_manifest.json").resolve()
+     manifest.parent.mkdir(parents=True, exist_ok=True)
+     payload = {
+         "workflow_id": context.workflow_id,
+         "validation_workflow_id": context.validation_workflow_id,
+         "repository_id": context.repository_id,
+         "mapping_id": context.mapping_id,
+         "mapping_name": context.mapping_name,
+         "deployed_at": datetime.now(timezone.utc).isoformat(),
+         "branch_name": context.branch_name,
+         "validation_evidence": context.validation_evidence,
+         "artifacts": [
+             {
+                 "artifact_id": a.artifact_id,
+                 "artifact_type": a.artifact_type,
+                 "file_name": a.file_name,
+                 "content_hash": a.content_hash,
+                 "git_path": p,
+             }
+             for (a, _), p in zip(verified, deployed_paths, strict=True)
+         ],
+     }
+     manifest.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+     deployed_paths.append(manifest.relative_to(worktree.resolve()).as_posix())
     def _clone(self, remote, base, worktree, env):
         subprocess.run(["git","clone","--branch",base,"--single-branch",remote,str(worktree)],env=env,capture_output=True,text=True,check=True,timeout=180)
 

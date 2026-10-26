@@ -10,10 +10,11 @@ Release 1 tables:
 - generated_artifact_etl
 - knowledge_base_etl
 
-This migration adds support for three Informatica ingestion methods:
+This migration adds support for Informatica ingestion methods and DataStage:
 - POWERCENTER
 - GITHUB
 - XML_UPLOAD
+- DSX_UPLOAD
 */
 
 
@@ -68,7 +69,8 @@ BEGIN
             connection_type IN (
                 'POWERCENTER',
                 'GITHUB',
-                'XML_UPLOAD'
+                'XML_UPLOAD',
+                'DSX_UPLOAD'
             )
         );
     END IF;

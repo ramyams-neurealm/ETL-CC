@@ -352,7 +352,7 @@ async def _process_mapping(
     latest_contract_error: str | None = None
 
     for attempt_index in range(1, settings.conversion_max_attempts + 1):
-        conversion_agent = ConversionAgent()
+        conversion_agent = ConversionAgent(mapping.source_vendor)
         conversion_audit = await _audit_start(
             session,
             workflow,
@@ -433,7 +433,7 @@ async def _process_mapping(
             )
             raise
 
-        critique_agent = CritiqueAgent()
+        critique_agent = CritiqueAgent(mapping.source_vendor)
         critique_audit = await _audit_start(
             session,
             workflow,

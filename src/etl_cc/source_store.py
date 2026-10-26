@@ -1,8 +1,8 @@
 """PostgreSQL-backed transient source store.
 
-Uploaded XML is retained only between analysis and discovery. After successful
-canonical mapping persistence, source_content is cleared in the same database
-transaction. No runtime_sources directory is used.
+Uploaded source exports are retained only between analysis and discovery.
+After successful canonical mapping persistence, source_content is cleared in
+the same database transaction. No runtime_sources directory is used.
 """
 from __future__ import annotations
 
