@@ -15,6 +15,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import StreamingResponse
@@ -31,6 +32,7 @@ from etl_cc.models import (
     DependencyPlanResponse,
     DiscoverySummaryResponse,
     GitHubConnectionRequest,
+    AbInitioGraphUploadRequest,
     MappingDiscoveryDetailsResponse,
     MappingInventoryResponse,
     MappingLineageDetailsResponse,
@@ -54,6 +56,7 @@ from etl_cc.models import (
     StartDeploymentRequest,
     StartDeploymentResponse,
     DeploymentMappingResponse,
+    WorkflowEventETL,
     DeploymentTargetResponse,
     GitHubDeploymentTargetTestRequest,
     GitHubDeploymentTargetTestResponse,
@@ -61,10 +64,12 @@ from etl_cc.models import (
     ETLProductsResponse,
     ETLProductResponse,
     ETLIngestionMethodResponse,
+    EnvironmentType,
 )
 from etl_cc.security import ConnectionTestTokenError
 from etl_cc.services import (
     analyze_github,
+    analyze_ab_initio_graph,
     analyze_powercenter,
     analyze_xml_upload,
     get_artifact_content,
@@ -141,6 +146,7 @@ async def list_etl_products() -> ETLProductsResponse:
     Disabled products remain visible so the UI can display them as unavailable.
     """
     informatica_enabled = bool(settings.enable_informatica)
+    ab_initio_enabled = bool(settings.enable_ab_initio)
 
     methods = [
         ETLIngestionMethodResponse(
@@ -235,11 +241,28 @@ async def list_etl_products() -> ETLProductsResponse:
                 product_code="AB_INITIO",
                 product_name="Ab Initio",
                 description="Ab Initio graphs",
-                enabled=True,
-                disabled_reason=None,
+                enabled=ab_initio_enabled,
+                disabled_reason=(
+                    None
+                    if ab_initio_enabled
+                    else "Ab Initio ingestion is not enabled."
+                ),
                 icon_key="ab-initio",
                 display_order=3,
-                ingestion_methods=[],
+                ingestion_methods=[
+                    ETLIngestionMethodResponse(
+                        method_code="AB_INITIO_GRAPH_UPLOAD",
+                        method_name="Ab Initio Graph Upload",
+                        description="Analyze a portable Ab Initio graph export.",
+                        enabled=ab_initio_enabled,
+                        disabled_reason=(
+                            None
+                            if ab_initio_enabled
+                            else "Ab Initio ingestion is not enabled."
+                        ),
+                        display_order=1,
+                    )
+                ],
             ),
         ]
     )
@@ -350,6 +373,42 @@ async def analyze_xml(
 
 
 @router.post(
+    "/sources/ab-initio/analyze",
+    response_model=SourceAnalysisResponse,
+    tags=["Sources"],
+)
+async def analyze_ab_initio(
+    connection_name: str = Form(...),
+    environment: EnvironmentType = Form(...),
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+):
+    try:
+        if not settings.enable_ab_initio:
+            raise ValueError("Ab Initio ingestion is not enabled.")
+        request = AbInitioGraphUploadRequest(
+            connection_name=connection_name,
+            environment=environment,
+        )
+        return await analyze_ab_initio_graph(
+            session,
+            request,
+            file.filename or "ab_initio_graph.mp",
+            await file.read(),
+        )
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "status": "FAILED",
+                "stage": "AB_INITIO_VALIDATION",
+                "reason": str(exc),
+            },
+        ) from exc
+
+
+@router.post(
     "/discoveries",
     response_model=SaveRepositoryResponse,
     status_code=status.HTTP_202_ACCEPTED,
@@ -432,7 +491,26 @@ async def workflow_status(
     row = await get_workflow_by_external_id(session, workflow_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Workflow not found.")
-    return _workflow_payload(row)
+    payload = _workflow_payload(row)
+    failure_event = await session.scalar(
+        select(WorkflowEventETL)
+        .where(
+            WorkflowEventETL.workflow_run_id == row.id,
+            WorkflowEventETL.event_type == "WORKFLOW_FAILED",
+        )
+        .order_by(WorkflowEventETL.id.desc())
+        .limit(1)
+    )
+    failure_details = (
+        failure_event.event_payload if failure_event else {}
+    ) or {}
+    payload["failure_category"] = failure_details.get("failure_category")
+    payload["failure_suggested_step"] = failure_details.get(
+        "failure_suggested_step"
+    )
+    payload["gliner_decision"] = failure_details.get("gliner_decision")
+    payload["gliner_confidence"] = failure_details.get("gliner_confidence")
+    return payload
 
 
 @router.get("/workflows/{workflow_id}/events", tags=["Workflows"])

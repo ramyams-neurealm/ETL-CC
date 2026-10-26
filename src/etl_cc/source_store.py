@@ -1,6 +1,6 @@
 """PostgreSQL-backed transient source store.
 
-Uploaded XML is retained only between analysis and discovery. After successful
+Uploaded source content is retained only between analysis and discovery. After successful
 canonical mapping persistence, source_content is cleared in the same database
 transaction. No runtime_sources directory is used.
 """
@@ -24,8 +24,8 @@ async def create_source(
     manifest: dict,
     content: bytes | None = None,
 ) -> tuple[str, str | None]:
-    if content is not None and len(content) > settings.max_xml_upload_bytes:
-        raise ValueError("The uploaded XML exceeds the configured size limit.")
+    if content is not None and len(content) > settings.max_source_upload_bytes:
+        raise ValueError("The uploaded source exceeds the configured size limit.")
     source_id = str(uuid4())
     digest = hashlib.sha256(content).hexdigest() if content is not None else None
     session.add(SourceSnapshotETL(

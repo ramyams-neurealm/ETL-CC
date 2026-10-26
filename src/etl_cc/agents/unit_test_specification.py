@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -76,6 +77,12 @@ class RuntimeColumnExpectation(BaseModel):
     nullable: bool = False
 
 
+class ParameterValue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    parameter_name: str
+    value: str | int | float | bool | None = None
+
+
 class UnitTestScenario(BaseModel):
     model_config = ConfigDict(extra="forbid")
     test_id: str
@@ -92,6 +99,7 @@ class UnitTestScenario(BaseModel):
     expected_rows: list[TestRow]
     comparison_keys: list[str] = Field(min_length=1)
     deterministic_columns: list[str] = Field(min_length=1)
+    parameter_values: list[ParameterValue] = Field(default_factory=list)
     runtime_columns: list[RuntimeColumnExpectation] = Field(default_factory=list)
 
 
@@ -104,11 +112,25 @@ class UnitTestSpecification(BaseModel):
 class UnitTestSpecificationValidator:
     """Validate LLM test semantics against canonical mapping metadata."""
 
-    VERSION = "1.3.0"
+    VERSION = "1.6.0"
     _CLOCK = re.compile(
         r"(?<![A-Za-z0-9_])(?:SYSDATE|SYSTIMESTAMP|CURRENT_TIMESTAMP|"
-        r"CURRENT_DATE|LOCALTIMESTAMP|NOW\s*\(|GETDATE\s*\()(?![A-Za-z0-9_])",
+        r"CURRENT_DATE|LOCALTIMESTAMP|NOW(?:\s*\()?|GETDATE(?:\s*\()?)"
+        r"(?![A-Za-z0-9_])",
         re.IGNORECASE,
+    )
+    _PURE_PARAMETER_EXPRESSIONS = (
+        re.compile(r"^\s*\$([A-Za-z_][A-Za-z0-9_]*)\s*$", re.IGNORECASE),
+        re.compile(
+            r"^\s*CAST\s*\(\s*\$([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+"
+            r"(?:DATE|TIMESTAMP(?:\s*\([^)]*\))?)\s*\)\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^\s*(?:TO_DATE|TO_TIMESTAMP)\s*\(\s*"
+            r"\$([A-Za-z_][A-Za-z0-9_]*)\s*(?:,\s*'[^']*'\s*)?\)\s*$",
+            re.IGNORECASE,
+        ),
     )
 
     @classmethod
@@ -130,6 +152,27 @@ class UnitTestSpecificationValidator:
             for target in mapping.targets
             for field in target.fields
         }
+        parameters = {
+            parameter.name.casefold(): parameter
+            for parameter in mapping.parameters
+        }
+        referenced_parameters = {
+            name.casefold()
+            for transformation in mapping.transformations
+            for port in transformation.ports
+            for name in re.findall(
+                r"\$([A-Za-z_][A-Za-z0-9_]*)",
+                str(port.expression or ""),
+            )
+        }
+        clock_default_parameters = {
+            parameter.name
+            for parameter in mapping.parameters
+            if (
+                parameter.name.casefold() in referenced_parameters
+                and cls._CLOCK.search(str(parameter.default_value or ""))
+            )
+        }
         runtime_fields = cls.runtime_fields(mapping)
         seen_ids: set[str] = set()
 
@@ -138,6 +181,63 @@ class UnitTestSpecificationValidator:
             if scenario.test_id in seen_ids:
                 errors.append(f"{prefix} duplicate test_id.")
             seen_ids.add(scenario.test_id)
+            parameter_names = [
+                item.parameter_name for item in scenario.parameter_values
+            ]
+            duplicate_parameters = sorted(
+                name
+                for name in set(parameter_names)
+                if parameter_names.count(name) > 1
+            )
+            unknown_parameters = sorted(
+                name
+                for name in parameter_names
+                if name.casefold() not in parameters
+            )
+            supplied_parameters = {name.casefold() for name in parameter_names}
+            missing_clock_parameters = sorted(
+                name
+                for name in clock_default_parameters
+                if name.casefold() not in supplied_parameters
+            )
+            if duplicate_parameters:
+                errors.append(
+                    f"{prefix} duplicate parameter value(s): "
+                    f"{', '.join(duplicate_parameters)}."
+                )
+            if unknown_parameters:
+                errors.append(
+                    f"{prefix} unknown parameter value(s): "
+                    f"{', '.join(unknown_parameters)}."
+                )
+            if missing_clock_parameters:
+                errors.append(
+                    f"{prefix} clock-default parameter(s) need fixed test values: "
+                    f"{', '.join(missing_clock_parameters)}."
+                )
+            for parameter_value in scenario.parameter_values:
+                parameter = parameters.get(parameter_value.parameter_name.casefold())
+                if parameter is None:
+                    continue
+                temporal_family = canonical_temporal_family(
+                    parameter.data_type or parameter.parameter_type
+                )
+                if temporal_family == "date":
+                    try:
+                        date.fromisoformat(str(parameter_value.value))
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"{prefix} parameter {parameter.name} must use an "
+                            "ISO date value."
+                        )
+                elif temporal_family == "timestamp":
+                    try:
+                        datetime.fromisoformat(str(parameter_value.value))
+                    except (TypeError, ValueError):
+                        errors.append(
+                            f"{prefix} parameter {parameter.name} must use an "
+                            "ISO timestamp value."
+                        )
 
             dataset_names = [item.dataset_name for item in scenario.input_datasets]
             duplicates = sorted(
@@ -270,13 +370,143 @@ class UnitTestSpecificationValidator:
         return errors
 
     @classmethod
+    def repair_parameter_derived_runtime_columns(
+        cls,
+        specification: UnitTestSpecification,
+        mapping: CanonicalMapping,
+    ) -> None:
+        """Make clock-default parameters fixed inputs in generated test specs.
+
+        Some LLM responses classify a target field sourced directly from a
+        CURRENT_DATE/NOW-defaulted parameter as a runtime clock output. These
+        fields are deterministic once a scenario supplies a fixed parameter
+        value, so repair that representation before validation and rendering.
+        """
+        parameters = {
+            parameter.name.casefold(): parameter
+            for parameter in mapping.parameters
+        }
+        clock_parameters = {
+            parameter.name.casefold(): parameter
+            for parameter in mapping.parameters
+            if cls._CLOCK.search(str(parameter.default_value or ""))
+            and canonical_temporal_family(
+                parameter.data_type or parameter.parameter_type
+            )
+            is not None
+        }
+        if not clock_parameters:
+            return
+
+        ports = {
+            (transformation.name, port.name): port
+            for transformation in mapping.transformations
+            for port in transformation.ports
+        }
+        incoming: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for connector in mapping.connectors:
+            if connector.to_field and connector.from_field:
+                incoming.setdefault(
+                    (connector.to_instance, connector.to_field),
+                    [],
+                ).append((connector.from_instance, connector.from_field))
+
+        def parameter_origin(
+            node: tuple[str, str],
+            visited: set[tuple[str, str]],
+        ) -> str | None:
+            if node in visited:
+                return None
+            visited = {*visited, node}
+            port = ports.get(node)
+            if port is not None and port.expression:
+                expression = str(port.expression)
+                for pattern in cls._PURE_PARAMETER_EXPRESSIONS:
+                    match = pattern.fullmatch(expression)
+                    if match:
+                        parameter_name = match.group(1).casefold()
+                        if parameter_name in clock_parameters:
+                            return parameter_name
+                return None
+
+            origins = {
+                origin
+                for upstream in incoming.get(node, [])
+                if (origin := parameter_origin(upstream, visited)) is not None
+            }
+            return next(iter(origins)) if len(origins) == 1 else None
+
+        target_parameter_fields: dict[str, str] = {}
+        for target in mapping.targets:
+            for field in target.fields:
+                origin = parameter_origin((target.name, field.name), set())
+                if origin is not None:
+                    target_parameter_fields[field.name] = origin
+        if not target_parameter_fields:
+            return
+
+        for scenario in specification.scenarios:
+            supplied = {
+                item.parameter_name.casefold(): item
+                for item in scenario.parameter_values
+            }
+            for parameter_name in set(target_parameter_fields.values()):
+                parameter = parameters[parameter_name]
+                if parameter_name in supplied:
+                    continue
+                family = canonical_temporal_family(
+                    parameter.data_type or parameter.parameter_type
+                )
+                if family == "date":
+                    fixed_value = "2000-01-01"
+                elif family == "timestamp":
+                    fixed_value = "2000-01-01T00:00:00"
+                else:
+                    continue
+                value = ParameterValue(
+                    parameter_name=parameter.name,
+                    value=fixed_value,
+                )
+                scenario.parameter_values.append(value)
+                supplied[parameter_name] = value
+
+            deterministic = list(dict.fromkeys(scenario.deterministic_columns))
+            for field_name, parameter_name in target_parameter_fields.items():
+                if supplied.get(parameter_name) is not None and field_name not in deterministic:
+                    deterministic.append(field_name)
+            scenario.runtime_columns = [
+                item
+                for item in scenario.runtime_columns
+                if item.column_name not in target_parameter_fields
+            ]
+
+            expected_rows = []
+            for row in scenario.expected_rows:
+                cells = {cell.field_name: cell for cell in row.cells}
+                for field_name, parameter_name in target_parameter_fields.items():
+                    parameter_value = supplied.get(parameter_name)
+                    if parameter_value is None:
+                        continue
+                    cells[field_name] = TestCell(
+                        field_name=field_name,
+                        value=parameter_value.value,
+                    )
+                expected_rows.append(
+                    TestRow(cells=list(cells.values()))
+                )
+            scenario.expected_rows = expected_rows
+            scenario.deterministic_columns = deterministic
+
+    @classmethod
     def runtime_fields(cls, mapping: CanonicalMapping) -> set[str]:
-        """Resolve target fields backed by a nondeterministic clock expression.
+        """Resolve target fields backed by clock expressions in the mapping.
 
         Runtime expressions frequently pass through Filter, Router, Joiner, or
         other transformations before reaching a target. Classification must
         therefore follow connector lineage backwards instead of inspecting only
-        the final port or matching fields globally by name.
+        the final port or matching fields globally by name. A parameter default
+        is deliberately not treated as a clock expression: tests can supply a
+        fixed parameter value and assert its exact output.
         """
         transformations = {
             transformation.name: transformation
@@ -334,29 +564,51 @@ class UnitTestSpecificationValidator:
                 if is_runtime_origin(target.name, field.name, set()):
                     runtime_targets.add(field.name)
 
-        # Preserve support for canonical mappings where a generated output is
-        # represented directly but connector-to-target metadata is unavailable.
-        if not mapping.connectors:
-            target_field_names = {
-                field.name
-                for target in mapping.targets
-                for field in target.fields
-            }
-            for transformation in transformations.values():
-                for port in transformation.ports:
-                    direction = str(port.direction or "").upper()
-                    if (
-                        port.name in target_field_names
-                        and direction
-                        in {
-                            "OUTPUT",
-                            "OUT",
-                            "INOUT",
-                            "INPUT/OUTPUT",
-                            "OUTPUT/INPUT",
-                        }
-                        and cls._CLOCK.search(str(port.expression or ""))
+        instance_edges: dict[str, set[str]] = {}
+        for connector in mapping.connectors:
+            instance_edges.setdefault(connector.from_instance, set()).add(
+                connector.to_instance
+            )
+
+        def reaches_target(start: str, target: str) -> bool:
+            pending = [start]
+            visited: set[str] = set()
+            while pending:
+                instance = pending.pop()
+                if instance == target:
+                    return True
+                if instance in visited:
+                    continue
+                visited.add(instance)
+                pending.extend(instance_edges.get(instance, set()) - visited)
+            return False
+
+        output_directions = {
+            "OUTPUT",
+            "OUT",
+            "INOUT",
+            "INPUT/OUTPUT",
+            "OUTPUT/INPUT",
+        }
+        for target in mapping.targets:
+            for field in target.fields:
+                target_node = (target.name, field.name)
+                if field.name in runtime_targets or incoming.get(target_node):
+                    continue
+                for transformation in transformations.values():
+                    if mapping.connectors and not reaches_target(
+                        transformation.name,
+                        target.name,
                     ):
-                        runtime_targets.add(port.name)
+                        continue
+                    for port in transformation.ports:
+                        if port.name != field.name or str(
+                            port.direction or ""
+                        ).upper() not in output_directions:
+                            continue
+                        expression = str(port.expression or "")
+                        if cls._CLOCK.search(expression):
+                            runtime_targets.add(field.name)
+                            break
 
         return runtime_targets

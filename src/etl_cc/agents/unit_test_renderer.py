@@ -16,7 +16,7 @@ from etl_cc.models import CanonicalField, CanonicalMapping
 
 
 class UnitTestRenderer:
-    VERSION = "1.1.0"
+    VERSION = "1.2.0"
 
     @classmethod
     def render(
@@ -27,6 +27,14 @@ class UnitTestRenderer:
     ) -> str:
         module_name = re.sub(r"\.py$", "", Path(pyspark_file_name).name)
         source_map = {dataset.name: dataset for dataset in mapping.sources}
+        target_field_map = {
+            field.name: field
+            for target in mapping.targets
+            for field in target.fields
+        }
+        parameter_map = {
+            parameter.name: parameter for parameter in mapping.parameters
+        }
         blocks = [
             '"""Deterministically rendered regression tests."""',
             "from datetime import date, datetime",
@@ -67,14 +75,30 @@ class UnitTestRenderer:
                 blocks.append(
                     f"    inputs[{dataset_name!r}] = spark.createDataFrame(rows_{cls._safe_identifier(dataset_name)}, schema_{cls._safe_identifier(dataset_name)})"
                 )
-            blocks.append("    actual = transform(inputs)")
+            if scenario.parameter_values:
+                values = {
+                    item.parameter_name: cls._coerce_parameter(
+                        item.value,
+                        parameter_map[item.parameter_name],
+                    )
+                    for item in scenario.parameter_values
+                }
+                blocks.append(
+                    "    actual = transform(inputs, "
+                    f"parameters={cls._python_literal(values)})"
+                )
+            else:
+                blocks.append("    actual = transform(inputs)")
             columns = scenario.deterministic_columns
             blocks.append(f"    deterministic_columns = {columns!r}")
             blocks.append(
                 f"    actual_rows = [tuple(row[c] for c in deterministic_columns) for row in actual.select(*deterministic_columns).orderBy(*{scenario.comparison_keys!r}).collect()]"
             )
             expected = [
-                tuple(row_dict[column] for column in columns)
+                tuple(
+                    cls._coerce(row_dict[column], target_field_map[column])
+                    for column in columns
+                )
                 for row_dict in (row.as_dict() for row in scenario.expected_rows)
             ]
             key_indexes = [columns.index(key) for key in scenario.comparison_keys]
@@ -147,6 +171,28 @@ class UnitTestRenderer:
         if any(token in dtype for token in ("double", "float", "real")):
             return float(value)
         if any(token in dtype for token in ("bool", "boolean")):
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in {"true", "1", "yes", "y"}
+        return str(value)
+
+    @staticmethod
+    def _coerce_parameter(value: Any, parameter: Any) -> Any:
+        if value is None:
+            return None
+        data_type = str(parameter.data_type or parameter.parameter_type or "").lower()
+        temporal_family = canonical_temporal_family(data_type)
+        if temporal_family == "timestamp":
+            return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+        if temporal_family == "date":
+            return value if isinstance(value, date) else date.fromisoformat(str(value))
+        if "decimal" in data_type or "numeric" in data_type or "number" in data_type:
+            return Decimal(str(value))
+        if any(token in data_type for token in ("int", "long", "smallint", "bigint")):
+            return int(value)
+        if any(token in data_type for token in ("double", "float", "real")):
+            return float(value)
+        if any(token in data_type for token in ("bool", "boolean")):
             if isinstance(value, bool):
                 return value
             return str(value).strip().lower() in {"true", "1", "yes", "y"}

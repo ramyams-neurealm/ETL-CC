@@ -9,13 +9,19 @@ repository credentials.
 """
 
 from collections import Counter
+import asyncio
 import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from etl_cc.key_vault_service import DynamicChatOpenAI
+from etl_cc.config import settings
+from etl_cc.logging_config import configure_logging
 from etl_cc.models import CanonicalMapping
+from etl_cc.gliner_service import gliner_service
+
+logger = configure_logging("DISCOVERY_AGENT")
 
 
 class DiscoveryBusinessRule(BaseModel):
@@ -111,6 +117,14 @@ class DiscoveryAnalysis(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     human_review_required: bool
 
+    gliner_decision: Literal[
+        "AUTO_CONVERT",
+        "HUMAN_REVIEW",
+        "BLOCK",
+        "DISABLED",
+    ] = "HUMAN_REVIEW"
+    gliner_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
 
 class DiscoveryAgent:
     """Analyze one CanonicalMapping without re-reading source XML."""
@@ -205,6 +219,31 @@ class DiscoveryAgent:
             or any(risk.severity in {"HIGH", "CRITICAL"} for risk in risks)
         )
 
+        high_risks = sum(1 for r in risks if r.severity in {"HIGH", "CRITICAL"})
+        gliner_summary = (
+            f"Complexity: {level}. "
+            f"High risks: {high_risks}. "
+            f"Unsupported constructs: {len(unsupported)}."
+        )
+        if settings.enable_gliner:
+            gliner_res = await asyncio.to_thread(
+                gliner_service.decide_discovery_routing,
+                gliner_summary,
+            )
+        else:
+            gliner_res = {"decision": "DISABLED", "confidence": 0.0}
+        if (
+            settings.enable_gliner
+            and not settings.gliner_shadow_mode
+            and gliner_res["decision"] != "AUTO_CONVERT"
+        ):
+            human_review = True
+        logger.info(
+            "GLINER_ADVICE decision=%s confidence=%.2f",
+            gliner_res["decision"],
+            gliner_res["confidence"],
+        )
+
         return DiscoveryAnalysis(
             business_purpose=semantic.business_purpose,
             business_rules=rules,
@@ -219,6 +258,8 @@ class DiscoveryAgent:
             migration_recommendations=semantic.migration_recommendations,
             confidence=semantic.confidence,
             human_review_required=human_review,
+            gliner_decision=gliner_res["decision"],
+            gliner_confidence=gliner_res["confidence"],
         )
 
     async def _run_llm(

@@ -27,7 +27,12 @@ from etl_cc.database import Base
 
 ETL_SCHEMA = settings.pg_schema
 ProductCode = Literal["INFORMATICA", "DATASTAGE", "AB_INITIO"]
-MethodCode = Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+MethodCode = Literal[
+    "POWERCENTER",
+    "GITHUB",
+    "XML_UPLOAD",
+    "AB_INITIO_GRAPH_UPLOAD",
+]
 ConnectionType = MethodCode
 EnvironmentType = Literal["DEV", "STAGING", "PROD"]
 
@@ -135,7 +140,7 @@ class ValidationDatasetETL(Base):
 
 
 class RepositoryETL(Base):
-    """Store one configured PowerCenter, GitHub, or XML-upload source."""
+    """Store one configured ETL source and its ingestion method."""
 
     __tablename__ = "repository_etl"
     __table_args__ = (
@@ -145,7 +150,7 @@ class RepositoryETL(Base):
             name="uq_repository_etl_name_environment",
         ),
         CheckConstraint(
-            "connection_type IN ('POWERCENTER', 'GITHUB', 'XML_UPLOAD')",
+            "connection_type IN ('POWERCENTER', 'GITHUB', 'XML_UPLOAD', 'AB_INITIO_GRAPH_UPLOAD')",
             name="ck_repository_etl_connection_type",
         ),
         Index("ix_repository_etl_connection_type", "connection_type"),
@@ -154,7 +159,7 @@ class RepositoryETL(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     repository_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    source_type: Mapped[str] = mapped_column(String(50), nullable=False, default="INFORMATICA")
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
     connection_type: Mapped[str] = mapped_column(String(30), nullable=False)
     environment: Mapped[str] = mapped_column(String(30), nullable=False)
     connection_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -498,6 +503,13 @@ class GitHubConnectionRequest(BaseModel):
     access_token: SecretStr | None = None
 
 
+class AbInitioGraphUploadRequest(BaseModel):
+    product_code: Literal["AB_INITIO"] = "AB_INITIO"
+    method_code: Literal["AB_INITIO_GRAPH_UPLOAD"] = "AB_INITIO_GRAPH_UPLOAD"
+    connection_name: str = Field(min_length=2, max_length=200)
+    environment: EnvironmentType
+
+
 class MappingSummary(BaseModel):
     source_object_key: str
     mapping_name: str
@@ -682,6 +694,8 @@ class MappingDiscoveryDetailsResponse(BaseModel):
     migration_recommendations: list[str] = Field(default_factory=list)
     confidence: float | None
     human_review_required: bool
+    gliner_decision: str | None = None
+    gliner_confidence: float | None = None
     readiness_status: str
     discovery_status: str
     model_name: str | None
@@ -766,6 +780,7 @@ class StartMigrationResponse(BaseModel):
 class StartConversionRequest(BaseModel):
     repository_id: int
     etl_object_ids: list[int] = Field(min_length=1)
+    migration_id: str | None = None
     target_platform: Literal["DATABRICKS"] = "DATABRICKS"
     target_framework: Literal["PYSPARK"] = "PYSPARK"
     follow_migration_waves: bool = True
@@ -899,6 +914,9 @@ class ValidationReportResponse(BaseModel):
     passed_tests: int
     failed_tests: int
     skipped_tests: int
+    human_review_required: bool = False
+    gliner_uncertain: bool | None = None
+    gliner_confidence: float | None = None
     mappings: list[ValidationMappingResponse] = Field(default_factory=list)
 
 
@@ -1000,7 +1018,7 @@ class DeploymentMappingResponse(BaseModel):
 
 
 class ETLIngestionMethodResponse(BaseModel):
-    method_code: Literal["POWERCENTER", "GITHUB", "XML_UPLOAD"]
+    method_code: MethodCode
     method_name: str
     description: str
     enabled: bool

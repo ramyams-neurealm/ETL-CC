@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from etl_cc.agents.spark_runtime import add_java_home_to_path
+
 
 class TestCaseResult(BaseModel):
     test_id: str
@@ -336,6 +338,7 @@ class UnitTestExecutionAgent:
                 "PYSPARK_DRIVER_PYTHON": sys.executable,
             }
         )
+        add_java_home_to_path(safe_env)
         return safe_env
 
     @staticmethod

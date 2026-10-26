@@ -16,6 +16,7 @@ from etl_cc.economics import (
     calculate_conversion_economics,
     calculate_discovery_economics,
 )
+from etl_cc.ab_initio_parser import AbInitioGraphParser
 from etl_cc.connectors import GitHubDeploymentTargetConnector, GitHubSource, PowerCenterSource
 from etl_cc.informatica_parser import InformaticaXMLParser
 from etl_cc.models import (
@@ -31,6 +32,7 @@ from etl_cc.models import (
     ETLObjectETL,
     GeneratedArtifactETL,
     GitHubConnectionRequest,
+    AbInitioGraphUploadRequest,
     MappingDiscoveryDetailsResponse,
     MappingInventoryResponse,
     MappingLineageDetailsResponse,
@@ -75,6 +77,7 @@ SUPPORTED_SOURCE_SELECTIONS = {
     ("INFORMATICA", "POWERCENTER"),
     ("INFORMATICA", "GITHUB"),
     ("INFORMATICA", "XML_UPLOAD"),
+    ("AB_INITIO", "AB_INITIO_GRAPH_UPLOAD"),
 }
 
 def _validate_source_selection(product_code: str, method_code: str, expected_method: str) -> None:
@@ -178,6 +181,64 @@ async def analyze_xml_upload(session, product_code, method_code, connection_name
     await session.commit(); return response
 
 
+async def analyze_ab_initio_graph(
+    session: AsyncSession,
+    request: AbInitioGraphUploadRequest,
+    file_name: str,
+    content: bytes,
+) -> SourceAnalysisResponse:
+    _validate_source_selection(
+        request.product_code,
+        request.method_code,
+        "AB_INITIO_GRAPH_UPLOAD",
+    )
+    if not file_name.lower().endswith(".mp"):
+        raise ValueError("Only .mp Ab Initio graph exports are accepted.")
+    if not content:
+        raise ValueError("The uploaded Ab Initio graph is empty.")
+
+    parser = AbInitioGraphParser()
+    source_reference = Path(file_name).name
+    mappings = parser.list_mappings_bytes(content, source_reference)
+    source_id, digest = await create_source(
+        session,
+        "AB_INITIO_GRAPH_UPLOAD",
+        {},
+        content,
+    )
+    payload = {
+        "connection_name": request.connection_name,
+        "environment": request.environment,
+        "file_name": source_reference,
+        "content_hash": digest,
+    }
+    response, fingerprint = _response(
+        request.product_code,
+        request.method_code,
+        source_id,
+        payload,
+        mappings,
+        "Ab Initio graph validated and graphs loaded.",
+    )
+    await update_manifest(session, source_id, {
+        "fingerprint": fingerprint,
+        "product_code": request.product_code,
+        "method_code": request.method_code,
+        "connection_type": request.method_code,
+        "connection_name": request.connection_name,
+        "environment": request.environment,
+        "config": {
+            "original_file_name": source_reference,
+            "source_format": AbInitioGraphParser.FORMAT,
+            "content_hash": digest,
+            "file_size": len(content),
+        },
+        "credential_ciphertext": None,
+    })
+    await session.commit()
+    return response
+
+
 async def start_discovery(
     session: AsyncSession,
     request: StartDiscoveryRequest,
@@ -186,6 +247,11 @@ async def start_discovery(
     verify_connection_test_token(request.test_token, manifest["fingerprint"])
     if request.scope_type == "SELECTED_MAPPINGS" and not request.selected_mapping_keys:
         raise ValueError("Select at least one mapping.")
+    selected_mapping_keys = (
+        request.selected_mapping_keys
+        if request.scope_type == "SELECTED_MAPPINGS"
+        else []
+    )
     repository = RepositoryETL(
         repository_name=manifest["connection_name"],
         source_type=manifest["product_code"],
@@ -213,7 +279,7 @@ async def start_discovery(
             "method_code": manifest["method_code"],
             "connection_type": manifest["connection_type"],
             "scope_type": request.scope_type,
-            "selected_mapping_keys": request.selected_mapping_keys,
+            "selected_mapping_keys": selected_mapping_keys,
         },
     )
     session.add(workflow)
@@ -637,6 +703,8 @@ async def get_mapping_discovery_details(
         ),
         confidence=payload.get("confidence"),
         human_review_required=review,
+        gliner_decision=payload.get("gliner_decision"),
+        gliner_confidence=payload.get("gliner_confidence"),
         readiness_status=ui_status,
         discovery_status=row.discovery_status,
         model_name=agent.model_name if agent else None,
@@ -788,23 +856,21 @@ async def start_migration(
         StartConversionRequest(
             repository_id=request.repository_id,
             etl_object_ids=request.etl_object_ids,
+            migration_id=migration_id,
             target_platform=request.target_platform,
             target_framework=request.target_framework,
             follow_migration_waves=request.follow_migration_waves,
         ),
+        commit=False,
     )
-    conversion = await get_workflow_by_external_id(
-        session, conversion_response.workflow_id
-    )
-    conversion.batch_id = migration_id
     parent.scope_payload = {
         **parent.scope_payload,
-        "conversion_workflow_id": conversion.workflow_id,
+        "conversion_workflow_id": conversion_response.workflow_id,
     }
     await session.commit()
     return StartMigrationResponse(
         migration_id=migration_id,
-        conversion_workflow_id=conversion.workflow_id,
+        conversion_workflow_id=conversion_response.workflow_id,
         repository_id=request.repository_id,
         status="QUEUED",
         mapping_count=len(set(request.etl_object_ids)),
@@ -994,6 +1060,73 @@ async def get_migration_token_utilization(
     }
 
 
+def _conversion_workbench_metrics(
+    mapping: ETLObjectETL,
+    audits: list[AgentResponseETL],
+    conversion_payload: dict[str, Any],
+    critique_payload: dict[str, Any],
+    code: str,
+) -> dict[str, dict[str, Any]]:
+    started = [item.started_at for item in audits if item.started_at]
+    completed = [item.completed_at for item in audits if item.completed_at]
+    duration_seconds = (
+        (max(completed) - min(started)).total_seconds()
+        if started and completed else 0.0
+    )
+    input_tokens = sum(int(item.input_tokens or 0) for item in audits)
+    output_tokens = sum(int(item.output_tokens or 0) for item in audits)
+    mapping_for_economics = {
+        "etl_object_id": mapping.id,
+        "complexity_score": mapping.complexity_score,
+        "transformation_count": mapping.transformation_count,
+        "human_review_required": bool(
+            critique_payload.get("revision_required", False)
+        ),
+        "status": (
+            "BLOCKED" if mapping.migration_status == "BLOCKED" else "READY"
+        ),
+        "dependencies": mapping.dependencies or {},
+    }
+    return {
+        "agent_performance": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "duration_seconds": round(duration_seconds, 2),
+            "duration_display": (
+                f"{int(duration_seconds // 60)}m {int(duration_seconds % 60)}s"
+            ),
+            "model_names": sorted({
+                item.model_name for item in audits if item.model_name
+            }),
+            "agent_cost": None,
+            "agent_cost_status": "TOKEN_PRICING_NOT_CONFIGURED",
+        },
+        "economics": calculate_conversion_economics(
+            mapping_for_economics, duration_seconds
+        ),
+        "quality": {
+            "lines_converted": len(
+                [line for line in code.splitlines() if line.strip()]
+            ),
+            "confidence": critique_payload.get(
+                "confidence", conversion_payload.get("confidence")
+            ),
+            "critique_decision": critique_payload.get("decision"),
+            "revision_required": critique_payload.get("revision_required"),
+            "business_rule_coverage": critique_payload.get(
+                "business_rule_coverage"
+            ),
+            "lineage_coverage": critique_payload.get("lineage_coverage"),
+            "code_coverage_accuracy": None,
+            "coverage_status": "PENDING_VALIDATION",
+            "deterministic_checks": critique_payload.get(
+                "deterministic_checks", []
+            ),
+        },
+    }
+
+
 async def get_migration_dashboard(
     session: AsyncSession,
     migration_id: str,
@@ -1055,6 +1188,40 @@ async def get_migration_dashboard(
         critique_payload = critique.response_payload if critique else {}
         validation_payload = validation_agent.response_payload if validation_agent else {}
         deployment_payload = deployment_agent.response_payload if deployment_agent else {}
+        conversion_audits = [
+            audit
+            for audit in audit_rows
+            if conversion is not None
+            and audit.workflow_run_id == conversion.id
+        ]
+        conversion_by_agent = {
+            audit.agent_name: audit for audit in conversion_audits
+        }
+        conversion_agent = conversion_by_agent.get("CONVERSION_AGENT")
+        conversion_critique = conversion_by_agent.get("CRITIQUE_AGENT")
+        conversion_payload = (
+            conversion_agent.response_payload or {} if conversion_agent else {}
+        )
+        conversion_critique_payload = (
+            conversion_critique.response_payload or {}
+            if conversion_critique else {}
+        )
+        generated_files = conversion_payload.get("generated_files") or []
+        pyspark_file = next(
+            (
+                item
+                for item in generated_files
+                if item.get("artifact_type") == "PYSPARK_CODE"
+            ),
+            {},
+        )
+        conversion_metrics = _conversion_workbench_metrics(
+            mapping,
+            conversion_audits,
+            conversion_payload,
+            conversion_critique_payload,
+            str(pyspark_file.get("content") or ""),
+        )
         mapping_events = [
             event for event in all_events
             if (event.get("event_payload") or {}).get("etl_object_id") == mapping.id
@@ -1087,6 +1254,7 @@ async def get_migration_dashboard(
             "migration_wave": mapping.migration_wave,
             "overall_status": mapping.migration_status,
             "progress_percentage": progress,
+            **conversion_metrics,
             "stages": {
                 "conversion": None if conversion is None else {
                     "workflow_id": conversion.workflow_id,
@@ -1217,6 +1385,8 @@ async def get_migration_lineage(session: AsyncSession, migration_id: str, etl_ob
 async def start_conversion(
     session: AsyncSession,
     request: StartConversionRequest,
+    *,
+    commit: bool = True,
 ) -> StartConversionResponse:
     repository = await session.get(RepositoryETL, request.repository_id)
     if repository is None:
@@ -1232,6 +1402,22 @@ async def start_conversion(
         raise ValueError(
             "One or more selected mappings do not belong to the repository."
         )
+    parent = None
+    if request.migration_id:
+        parent = await get_workflow_by_external_id(session, request.migration_id)
+        if (
+            parent is None
+            or parent.job_type != "MIGRATION"
+            or parent.repository_id != request.repository_id
+        ):
+            raise ValueError("Migration not found for this repository.")
+        migration_mapping_ids = set(
+            parent.scope_payload.get("etl_object_ids", [])
+        )
+        if not set(selected_ids).issubset(migration_mapping_ids):
+            raise ValueError(
+                "One or more selected mappings are not part of the Migration."
+            )
     not_ready = [
         row.object_name
         for row in rows
@@ -1239,6 +1425,22 @@ async def start_conversion(
         or row.has_dependency_cycle
         or row.migration_wave is None
     ]
+    if settings.enable_gliner and not settings.gliner_shadow_mode:
+        for row in rows:
+            discovery = await _latest_agent_response(
+                session,
+                etl_object_id=row.id,
+                agent_name="DISCOVERY_AGENT",
+            )
+            decision = (
+                (
+                    getattr(discovery, "response_payload", None) or {}
+                ).get("gliner_decision")
+                if discovery
+                else None
+            )
+            if decision != "AUTO_CONVERT" and row.object_name not in not_ready:
+                not_ready.append(row.object_name)
     if not_ready:
         raise ValueError(
             "Mappings are not ready for conversion: "
@@ -1246,6 +1448,7 @@ async def start_conversion(
         )
     workflow = WorkflowRunETL(
         workflow_id=f"CONV-{uuid4()}",
+        batch_id=parent.workflow_id if parent else None,
         repository_id=request.repository_id,
         current_stage="CONVERSION",
         overall_status="QUEUED",
@@ -1276,7 +1479,8 @@ async def start_conversion(
     ))
     for row in rows:
         row.migration_status = "QUEUED"
-    await session.commit()
+    if commit:
+        await session.commit()
     return StartConversionResponse(
         workflow_id=workflow.workflow_id,
         repository_id=workflow.repository_id,
@@ -1432,15 +1636,6 @@ async def get_conversion_workbench(
     conversion_payload = conversion.response_payload if conversion else {}
     critique_payload = critique.response_payload if critique else {}
 
-    started = [item.started_at for item in audits if item.started_at]
-    completed = [item.completed_at for item in audits if item.completed_at]
-    duration_seconds = (
-        (max(completed) - min(started)).total_seconds()
-        if started and completed else 0.0
-    )
-    input_tokens = sum(int(item.input_tokens or 0) for item in audits)
-    output_tokens = sum(int(item.output_tokens or 0) for item in audits)
-
     artifact_payloads: list[dict[str, Any]] = []
     target_artifact: dict[str, Any] | None = None
     for artifact in artifacts:
@@ -1468,7 +1663,6 @@ async def get_conversion_workbench(
             target_artifact = payload
 
     code = (target_artifact or {}).get("content") or ""
-    lines_converted = len([line for line in code.splitlines() if line.strip()])
     recommendations = [
         item.get("recommendation")
         for item in critique_payload.get("issues", [])
@@ -1476,18 +1670,13 @@ async def get_conversion_workbench(
     ]
     recommendations.extend(conversion_payload.get("manual_actions") or [])
 
-    mapping_for_economics = {
-        "etl_object_id": mapping.id,
-        "complexity_score": mapping.complexity_score,
-        "transformation_count": mapping.transformation_count,
-        "human_review_required": bool(
-            critique_payload.get("revision_required", False)
-        ),
-        "status": (
-            "BLOCKED" if mapping.migration_status == "BLOCKED" else "READY"
-        ),
-        "dependencies": mapping.dependencies or {},
-    }
+    workbench_metrics = _conversion_workbench_metrics(
+        mapping,
+        audits,
+        conversion_payload,
+        critique_payload,
+        code,
+    )
 
     return {
         "workflow": {
@@ -1517,40 +1706,7 @@ async def get_conversion_workbench(
             "source_definition": mapping.source_definition or {},
         },
         "target": target_artifact,
-        "agent_performance": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "duration_seconds": round(duration_seconds, 2),
-            "duration_display": (
-                f"{int(duration_seconds // 60)}m {int(duration_seconds % 60)}s"
-            ),
-            "model_names": sorted({
-                item.model_name for item in audits if item.model_name
-            }),
-            "agent_cost": None,
-            "agent_cost_status": "TOKEN_PRICING_NOT_CONFIGURED",
-        },
-        "economics": calculate_conversion_economics(
-            mapping_for_economics, duration_seconds
-        ),
-        "quality": {
-            "lines_converted": lines_converted,
-            "confidence": critique_payload.get(
-                "confidence", conversion_payload.get("confidence")
-            ),
-            "critique_decision": critique_payload.get("decision"),
-            "revision_required": critique_payload.get("revision_required"),
-            "business_rule_coverage": critique_payload.get(
-                "business_rule_coverage"
-            ),
-            "lineage_coverage": critique_payload.get("lineage_coverage"),
-            "code_coverage_accuracy": None,
-            "coverage_status": "PENDING_VALIDATION",
-            "deterministic_checks": critique_payload.get(
-                "deterministic_checks", []
-            ),
-        },
+        **workbench_metrics,
         "recommendations": list(dict.fromkeys(recommendations)),
         "conversion": conversion_payload or None,
         "critique": critique_payload or None,
@@ -1825,6 +1981,31 @@ async def get_validation_report(
         passed_tests += int(unit.get("passed", 0) or 0)
         failed_tests += int(unit.get("failed", 0) or 0)
         skipped_tests += int(unit.get("skipped", 0) or 0)
+    validation_agents = list(
+        (
+            await session.scalars(
+                select(AgentResponseETL)
+                .where(
+                    AgentResponseETL.workflow_run_id == workflow.id,
+                    AgentResponseETL.agent_name == "VALIDATION_AGENT",
+                )
+                .order_by(AgentResponseETL.id.desc())
+            )
+        ).all()
+    )
+    validation_payloads = [
+        agent.response_payload or {} for agent in validation_agents
+    ]
+    gliner_uncertainty_values = [
+        payload["gliner_uncertain"]
+        for payload in validation_payloads
+        if payload.get("gliner_uncertain") is not None
+    ]
+    gliner_confidence_values = [
+        float(payload["gliner_confidence"])
+        for payload in validation_payloads
+        if payload.get("gliner_confidence") is not None
+    ]
     return ValidationReportResponse(
         workflow_id=workflow.workflow_id,
         repository_id=workflow.repository_id,
@@ -1836,6 +2017,22 @@ async def get_validation_report(
         passed_tests=passed_tests,
         failed_tests=failed_tests,
         skipped_tests=skipped_tests,
+        human_review_required=bool(
+            any(
+                payload.get("human_review_required", False)
+                for payload in validation_payloads
+            )
+        ),
+        gliner_uncertain=(
+            any(gliner_uncertainty_values)
+            if gliner_uncertainty_values
+            else None
+        ),
+        gliner_confidence=(
+            min(gliner_confidence_values)
+            if gliner_confidence_values
+            else None
+        ),
         mappings=mappings,
     )
 
