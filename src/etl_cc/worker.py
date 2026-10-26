@@ -455,4 +455,5 @@ async def run_worker() -> None:
 
 
 if __name__ == "__main__":
+    print(">>> 2. Starting asyncio event loop...")
     asyncio.run(run_worker())
