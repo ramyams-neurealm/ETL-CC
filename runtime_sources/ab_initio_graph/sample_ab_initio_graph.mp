@@ -1,0 +1,203 @@
+{
+  "format": "AB_INITIO_GRAPH_JSON",
+  "format_version": "1.0",
+  "file_extension": ".mp",
+  "project": "transactions",
+  "graphs": [
+    {
+      "name": "g_load_high_value_txns",
+      "version": "synthetic-v3",
+      "description": "Filter transactions where TXN_AMOUNT is greater than or equal to THRESHOLD_AMT. Generate ALERT_ID using ALRT_ plus TXN_ID. Copy CUSTOMER_ID and TXN_AMOUNT to target. Populate PROCESSED_ON with a deterministic processing date.",
+      "unsupported_constructs": [],
+      "parameters": [
+        {
+          "name": "PROC_DATE",
+          "parameter_type": "DATE",
+          "data_type": "DATE",
+          "default_value": "CURRENT_DATE",
+          "scope": "GRAPH"
+        },
+        {
+          "name": "THRESHOLD_AMT",
+          "parameter_type": "DECIMAL",
+          "data_type": "DECIMAL",
+          "default_value": "10000.00",
+          "scope": "GRAPH"
+        }
+      ],
+      "datasets": {
+        "sources": [
+          {
+            "name": "SRC_TRANSACTIONS",
+            "connection_name": "synthetic_txns_db",
+            "fields": [
+              {
+                "name": "TXN_ID",
+                "data_type": "STRING",
+                "nullable": false
+              },
+              {
+                "name": "CUSTOMER_ID",
+                "data_type": "INTEGER",
+                "nullable": false
+              },
+              {
+                "name": "TXN_AMOUNT",
+                "data_type": "DECIMAL",
+                "precision": 15,
+                "scale": 2,
+                "nullable": false
+              },
+              {
+                "name": "TXN_TYPE",
+                "data_type": "STRING",
+                "nullable": true
+              }
+            ]
+          }
+        ],
+        "targets": [
+          {
+            "name": "TGT_HIGH_VALUE_ALERTS",
+            "connection_name": "synthetic_alerts_db",
+            "fields": [
+              {
+                "name": "ALERT_ID",
+                "data_type": "STRING",
+                "nullable": false
+              },
+              {
+                "name": "CUSTOMER_ID",
+                "data_type": "INTEGER",
+                "nullable": false
+              },
+              {
+                "name": "ALERT_AMOUNT",
+                "data_type": "DECIMAL",
+                "precision": 15,
+                "scale": 2,
+                "nullable": false
+              },
+              {
+                "name": "PROCESSED_ON",
+                "data_type": "DATE",
+                "nullable": false
+              }
+            ]
+          }
+        ]
+      },
+      "components": [
+        {
+          "name": "FILTER_HIGH_VALUE",
+          "type": "FILTER",
+          "properties": {
+            "condition": "TXN_AMOUNT >= $THRESHOLD_AMT"
+          }
+        },
+        {
+          "name": "REFORMAT_TO_ALERT",
+          "type": "REFORMAT",
+          "ports": [
+            {
+              "name": "ALERT_ID",
+              "direction": "OUTPUT",
+              "expression": "concat('ALRT_', TXN_ID)"
+            },
+            {
+              "name": "CUSTOMER_ID",
+              "direction": "OUTPUT",
+              "expression": "CUSTOMER_ID"
+            },
+            {
+              "name": "ALERT_AMOUNT",
+              "direction": "OUTPUT",
+              "expression": "TXN_AMOUNT"
+            },
+            {
+              "name": "PROCESSED_ON",
+              "direction": "OUTPUT",
+              "expression": "$PROC_DATE"
+            }
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from_instance": "SRC_TRANSACTIONS",
+          "to_instance": "FILTER_HIGH_VALUE"
+        },
+        {
+          "from_instance": "FILTER_HIGH_VALUE",
+          "to_instance": "REFORMAT_TO_ALERT"
+        },
+        {
+          "from_instance": "REFORMAT_TO_ALERT",
+          "to_instance": "TGT_HIGH_VALUE_ALERTS"
+        }
+      ],
+      "field_links": [
+        {
+          "from_instance": "SRC_TRANSACTIONS",
+          "from_field": "TXN_ID",
+          "to_instance": "FILTER_HIGH_VALUE",
+          "to_field": "TXN_ID"
+        },
+        {
+          "from_instance": "SRC_TRANSACTIONS",
+          "from_field": "CUSTOMER_ID",
+          "to_instance": "FILTER_HIGH_VALUE",
+          "to_field": "CUSTOMER_ID"
+        },
+        {
+          "from_instance": "SRC_TRANSACTIONS",
+          "from_field": "TXN_AMOUNT",
+          "to_instance": "FILTER_HIGH_VALUE",
+          "to_field": "TXN_AMOUNT"
+        },
+        {
+          "from_instance": "FILTER_HIGH_VALUE",
+          "from_field": "TXN_ID",
+          "to_instance": "REFORMAT_TO_ALERT",
+          "to_field": "TXN_ID"
+        },
+        {
+          "from_instance": "FILTER_HIGH_VALUE",
+          "from_field": "CUSTOMER_ID",
+          "to_instance": "REFORMAT_TO_ALERT",
+          "to_field": "CUSTOMER_ID"
+        },
+        {
+          "from_instance": "FILTER_HIGH_VALUE",
+          "from_field": "TXN_AMOUNT",
+          "to_instance": "REFORMAT_TO_ALERT",
+          "to_field": "TXN_AMOUNT"
+        },
+        {
+          "from_instance": "REFORMAT_TO_ALERT",
+          "from_field": "ALERT_ID",
+          "to_instance": "TGT_HIGH_VALUE_ALERTS",
+          "to_field": "ALERT_ID"
+        },
+        {
+          "from_instance": "REFORMAT_TO_ALERT",
+          "from_field": "CUSTOMER_ID",
+          "to_instance": "TGT_HIGH_VALUE_ALERTS",
+          "to_field": "CUSTOMER_ID"
+        },
+        {
+          "from_instance": "REFORMAT_TO_ALERT",
+          "from_field": "ALERT_AMOUNT",
+          "to_instance": "TGT_HIGH_VALUE_ALERTS",
+          "to_field": "ALERT_AMOUNT"
+        },
+        {
+          "from_instance": "REFORMAT_TO_ALERT",
+          "from_field": "PROCESSED_ON",
+          "to_instance": "TGT_HIGH_VALUE_ALERTS",
+          "to_field": "PROCESSED_ON"
+        }
+      ]
+    }
+  ]
+}

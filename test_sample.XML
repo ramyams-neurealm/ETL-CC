@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<POWERMART CREATION_DATE="2026-09-17" REPOSITORY_VERSION="185.93">
+    <REPOSITORY NAME="DEV_REPO" VERSION="185.93">
+        <FOLDER NAME="ETL_DEMO" OWNER="Admin">
+
+            <!-- Source Definition -->
+            <SOURCE NAME="SRC_EMPLOYEE" DATABASETYPE="Oracle">
+                <SOURCEFIELD NAME="EMP_ID" DATATYPE="NUMBER" PRECISION="10"/>
+                <SOURCEFIELD NAME="EMP_NAME" DATATYPE="VARCHAR2" PRECISION="100"/>
+                <SOURCEFIELD NAME="SALARY" DATATYPE="NUMBER" PRECISION="12"/>
+            </SOURCE>
+
+            <!-- Target Definition -->
+            <TARGET NAME="TGT_EMPLOYEE" DATABASETYPE="Snowflake">
+                <TARGETFIELD NAME="EMP_ID" DATATYPE="NUMBER"/>
+                <TARGETFIELD NAME="EMP_NAME" DATATYPE="VARCHAR"/>
+                <TARGETFIELD NAME="SALARY" DATATYPE="NUMBER"/>
+                <TARGETFIELD NAME="LOAD_DATE" DATATYPE="TIMESTAMP"/>
+            </TARGET>
+
+            <!-- Mapping -->
+            <MAPPING NAME="m_EMPLOYEE_LOAD">
+
+                <TRANSFORMATION
+                    NAME="SQ_SRC_EMPLOYEE"
+                    TYPE="Source Qualifier">
+                    <TABLEATTRIBUTE
+                        NAME="Sql Query"
+                        VALUE="SELECT EMP_ID, EMP_NAME, SALARY FROM SRC_EMPLOYEE"/>
+                </TRANSFORMATION>
+
+                <TRANSFORMATION
+                    NAME="EXP_EMPLOYEE"
+                    TYPE="Expression">
+
+                    <TRANSFORMFIELD
+                        NAME="EMP_ID"
+                        DATATYPE="NUMBER"/>
+
+                    <TRANSFORMFIELD
+                        NAME="EMP_NAME"
+                        DATATYPE="STRING"/>
+
+                    <TRANSFORMFIELD
+                        NAME="SALARY"
+                        DATATYPE="NUMBER"/>
+
+                    <TRANSFORMFIELD
+                        NAME="LOAD_DATE"
+                        DATATYPE="DATE"
+                        EXPRESSION="SYSDATE"/>
+                </TRANSFORMATION>
+
+                <!-- Connectors -->
+                <CONNECTOR
+                    FROMINSTANCE="SQ_SRC_EMPLOYEE"
+                    FROMFIELD="EMP_ID"
+                    TOINSTANCE="EXP_EMPLOYEE"
+                    TOFIELD="EMP_ID"/>
+
+                <CONNECTOR
+                    FROMINSTANCE="SQ_SRC_EMPLOYEE"
+                    FROMFIELD="EMP_NAME"
+                    TOINSTANCE="EXP_EMPLOYEE"
+                    TOFIELD="EMP_NAME"/>
+
+                <CONNECTOR
+                    FROMINSTANCE="SQ_SRC_EMPLOYEE"
+                    FROMFIELD="SALARY"
+                    TOINSTANCE="EXP_EMPLOYEE"
+                    TOFIELD="SALARY"/>
+
+            </MAPPING>
+
+            <!-- Workflow -->
+            <WORKFLOW NAME="wf_EMPLOYEE_LOAD">
+                <TASK NAME="s_m_EMPLOYEE_LOAD" TYPE="SESSION"/>
+                <TASK NAME="cmd_PreProcess" TYPE="COMMAND"/>
+                <TASKINSTANCE NAME="s_m_EMPLOYEE_LOAD"/>
+            </WORKFLOW>
+
+        </FOLDER>
+    </REPOSITORY>
+</POWERMART>

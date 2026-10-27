@@ -1,0 +1,13 @@
+{
+  "source_vendor": "DATASTAGE_DSX",
+  "source_object_key": "DemoProject/DSJOB/Job_Customers",
+  "mapping_name": "Job_Customers",
+  "sources": ["SRC_CUSTOMERS"],
+  "targets": ["TGT_CUSTOMERS"],
+  "transformations": ["TR_CUSTOMERS"],
+  "connectors": 1,
+  "parameters": ["BatchDate"],
+  "workflows": ["Seq_Customers"],
+  "stage_count": 3,
+  "link_count": 1
+}

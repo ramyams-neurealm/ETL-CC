@@ -1,0 +1,14 @@
+{
+  "source_id": "e29efa9e-7238-4585-997f-8347b6751951",
+  "fingerprint": "065d0cf0947105806cd6f879f515c7837a6631d6643f1eb90b6663a9ee1afcf0",
+  "connection_type": "XML_UPLOAD",
+  "connection_name": "NEUFLOW_E2E_DEMO_3",
+  "environment": "DEV",
+  "config": {
+    "original_file_name": "sample_informatica_multi_mapping.xml",
+    "stored_file_path": "C:\\Users\\viaan.sharma\\ETL-CC\\runtime_sources\\xml_upload\\e29efa9e-7238-4585-997f-8347b6751951\\sample_informatica_multi_mapping.xml",
+    "content_hash": "db9e93b307ad99da82a26583f854f4d054bbd2d0ba5b72bcca5bdecfdce170cc",
+    "file_size": 7038
+  },
+  "credential_ciphertext": null
+}
