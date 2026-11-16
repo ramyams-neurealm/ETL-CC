@@ -224,6 +224,39 @@ def test_literal_date_is_expected_exactly_in_rendered_test():
     assert "'PROCESSED_ON'" in rendered
 
 
+def test_multi_target_scenarios_render_target_specific_assertions():
+    mapping = AbInitioGraphParser().parse_file(FIXTURE)[0]
+    original_target = mapping.targets[0]
+    reject_target_name = "TGT_REJECTS"
+    mapping.targets.append(
+        original_target.model_copy(update={"name": reject_target_name})
+    )
+    specification = _specification(
+        with_fixed_parameter=True,
+        declares_runtime=False,
+        include_expected_date=True,
+    )
+    primary_scenario = specification.scenarios[0]
+    primary_scenario.target_name = original_target.name
+    reject_scenario = primary_scenario.model_copy(
+        deep=True,
+        update={
+            "test_id": "UTS002",
+            "title": "Rejected records reach the reject target",
+            "target_name": reject_target_name,
+        },
+    )
+    specification.scenarios.append(reject_scenario)
+
+    assert UnitTestSpecificationValidator.validate(specification, mapping) == []
+    rendered = UnitTestRenderer.render(specification, mapping, "transform.py")
+
+    assert "from decimal import Decimal" in rendered
+    assert f"assert set(actual) == set({[original_target.name, reject_target_name]!r})" in rendered
+    assert f"actual = actual[{original_target.name!r}]" in rendered
+    assert f"actual = actual[{reject_target_name!r}]" in rendered
+
+
 @pytest.mark.parametrize(
     "expression",
     [

@@ -205,11 +205,23 @@ def _compact_event_fields(event: str, fields: dict[str, Any]) -> dict[str, Any]:
 
 def configure_logging(component: str) -> logging.Logger:
     global _CONFIGURED
+    configured_level_name = os.environ.get("ETL_CC_LOG_LEVEL", "INFO").strip().upper()
+    configured_level = getattr(logging, configured_level_name, None)
+    if configured_level not in {
+        logging.DEBUG,
+        logging.INFO,
+        logging.WARNING,
+        logging.ERROR,
+        logging.CRITICAL,
+    }:
+        raise ValueError(
+            "ETL_CC_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+        )
     with _CONFIG_LOCK:
         if not _CONFIGURED:
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             root = logging.getLogger()
-            root.setLevel(logging.INFO)
+            root.setLevel(configured_level)
             root.handlers.clear()
 
             handler = WatchedFileHandler(
@@ -218,7 +230,7 @@ def configure_logging(component: str) -> logging.Logger:
                 encoding="utf-8",
                 delay=False,
             )
-            handler.setLevel(logging.INFO)
+            handler.setLevel(configured_level)
             handler.setFormatter(logging.Formatter(
                 "%(asctime)s %(levelname)s [%(name)s] %(message)s",
                 "%Y-%m-%d %H:%M:%S",
@@ -232,7 +244,7 @@ def configure_logging(component: str) -> logging.Logger:
             _CONFIGURED = True
 
     logger = logging.getLogger(component)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(configured_level)
     logger.propagate = True
     return logger
 

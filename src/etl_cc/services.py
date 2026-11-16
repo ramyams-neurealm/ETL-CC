@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from etl_cc.config import settings
@@ -29,11 +29,13 @@ from etl_cc.models import (
     ComplexityDistribution,
     ConversionMappingResponse,
     DependencyPlanResponse,
+    DiscoveryOperationalMetrics,
     DiscoverySummaryResponse,
     ETLObjectETL,
     GeneratedArtifactETL,
     GitHubConnectionRequest,
     AbInitioGraphUploadRequest,
+    KnowledgeBaseETL,
     MappingDiscoveryDetailsResponse,
     MappingInventoryResponse,
     MappingLineageDetailsResponse,
@@ -57,6 +59,8 @@ from etl_cc.models import (
     GitHubDeploymentTargetTestResponse,
     SaveDeploymentTargetRequest,
     DeploymentWorkflowReference,
+    RAGAutomationMetrics,
+    RAGRetrievalEventETL,
     ValidationMappingResponse,
     ValidationReportResponse,
     ValidationTestCaseETL,
@@ -496,6 +500,21 @@ async def _latest_agent_response(
     )
 
 
+def _rag_api_response(
+    audit: AgentResponseETL | None,
+) -> dict[str, Any] | None:
+    if audit is None:
+        return None
+    payload = dict(audit.response_payload or {})
+    payload["audit_status"] = audit.status
+    payload["embedding_input_tokens"] = int(
+        payload.get("embedding_input_tokens")
+        or audit.input_tokens
+        or 0
+    )
+    return payload
+
+
 def _readiness(
     payload: dict[str, Any],
     row: ETLObjectETL,
@@ -515,6 +534,238 @@ def _readiness(
     if row.discovery_status == "ANALYZED":
         return "DISCOVERY_COMPLETE", "READY", "PASS", False
     return "DISCOVERY", "PENDING", "PENDING", review
+
+
+def _percentage(numerator: int, denominator: int) -> float:
+    """Return a zero-safe percentage rounded to one decimal place."""
+    return round(numerator * 100.0 / denominator, 1) if denominator else 0.0
+
+
+def _review_required_from_payloads(
+    source_definition: Any,
+    response_payload: Any,
+) -> bool:
+    """Read the persisted Discovery review flag without assuming JSON shapes."""
+    if isinstance(response_payload, dict):
+        response_value = response_payload.get("human_review_required")
+        if isinstance(response_value, bool):
+            return response_value
+
+    if isinstance(source_definition, dict):
+        discovery_analysis = source_definition.get("discovery_analysis")
+        if isinstance(discovery_analysis, dict):
+            source_value = discovery_analysis.get("human_review_required")
+            if isinstance(source_value, bool):
+                return source_value
+    return False
+
+
+async def _discovery_operational_metrics(
+    session: AsyncSession,
+    repository_id: int,
+) -> DiscoveryOperationalMetrics:
+    """Calculate repository-scoped KPIs from mappings and persisted agent audits.
+
+    Discovery objects currently correspond to ETL mappings. Future phases may
+    model tables, views, procedures, and packages as separate discovery objects.
+    For review flags, the latest Discovery audit is selected by
+    ``completed_at`` descending, falling back to ``created_at`` when completion
+    time is null, with ID descending as the final tie-breaker.
+    """
+    mapping_rows = list(
+        (
+            await session.execute(
+                select(
+                    ETLObjectETL.id,
+                    ETLObjectETL.discovery_status,
+                    ETLObjectETL.migration_status,
+                    ETLObjectETL.source_definition,
+                ).where(ETLObjectETL.repository_id == repository_id)
+            )
+        ).all()
+    )
+    mapping_ids = {row[0] for row in mapping_rows}
+    total_mappings = len(mapping_rows)
+
+    completed_statuses = {"CONVERTED", "VALIDATED", "DEPLOYED"}
+    pending_statuses = {
+        "NOT_STARTED",
+        "QUEUED",
+        "CONVERTING",
+        "VALIDATING",
+        "DEPLOYMENT_QUEUED",
+        "DEPLOYMENT_IN_PROGRESS",
+    }
+    failed_statuses = {
+        "CONVERSION_FAILED",
+        "VALIDATION_FAILED",
+        "DEPLOYMENT_FAILED",
+    }
+    converted_mappings = sum(
+        row[2] in completed_statuses for row in mapping_rows
+    )
+    pending_mappings = sum(row[2] in pending_statuses for row in mapping_rows)
+    failed_mappings = sum(row[2] in failed_statuses for row in mapping_rows)
+    review_required_mappings = sum(
+        row[2] == "REVIEW_REQUIRED" for row in mapping_rows
+    )
+    discovered_objects = sum(
+        row[1] in {"DISCOVERED", "ANALYZED"} for row in mapping_rows
+    )
+
+    discovery_payload_by_mapping: dict[int, Any] = {}
+    if mapping_ids:
+        discovery_audits = (
+            await session.execute(
+                select(
+                    AgentResponseETL.etl_object_id,
+                    AgentResponseETL.response_payload,
+                )
+                .join(
+                    ETLObjectETL,
+                    ETLObjectETL.id == AgentResponseETL.etl_object_id,
+                )
+                .where(
+                    ETLObjectETL.repository_id == repository_id,
+                    AgentResponseETL.agent_name == "DISCOVERY_AGENT",
+                    AgentResponseETL.etl_object_id.is_not(None),
+                )
+                .order_by(
+                    func.coalesce(
+                        AgentResponseETL.completed_at,
+                        AgentResponseETL.created_at,
+                    ).desc(),
+                    AgentResponseETL.id.desc(),
+                )
+            )
+        ).all()
+        for mapping_id, response_payload in discovery_audits:
+            if mapping_id in mapping_ids:
+                discovery_payload_by_mapping.setdefault(
+                    mapping_id,
+                    response_payload,
+                )
+
+    mappings_requiring_review = sum(
+        _review_required_from_payloads(
+            source_definition,
+            discovery_payload_by_mapping.get(mapping_id),
+        )
+        for mapping_id, _discovery_status, _migration_status, source_definition
+        in mapping_rows
+    )
+
+    total_agent_runs = successful_agent_runs = 0
+    failed_agent_runs = running_agent_runs = 0
+    total_input_tokens = total_output_tokens = 0
+    agent_breakdown: dict[str, dict[str, int | float]] = {}
+    if mapping_ids:
+        agent_rows = (
+            await session.execute(
+                select(
+                    AgentResponseETL.agent_name,
+                    AgentResponseETL.status,
+                    func.count(AgentResponseETL.id),
+                    func.coalesce(func.sum(AgentResponseETL.input_tokens), 0),
+                    func.coalesce(func.sum(AgentResponseETL.output_tokens), 0),
+                )
+                .join(
+                    ETLObjectETL,
+                    ETLObjectETL.id == AgentResponseETL.etl_object_id,
+                )
+                .where(
+                    ETLObjectETL.repository_id == repository_id,
+                    AgentResponseETL.etl_object_id.is_not(None),
+                )
+                .group_by(
+                    AgentResponseETL.agent_name,
+                    AgentResponseETL.status,
+                )
+            )
+        ).all()
+        for agent_name, status, run_count, input_tokens, output_tokens in agent_rows:
+            key = str(agent_name or "UNKNOWN")
+            count = int(run_count or 0)
+            input_count = int(input_tokens or 0)
+            output_count = int(output_tokens or 0)
+            breakdown = agent_breakdown.setdefault(
+                key,
+                {
+                    "total_runs": 0,
+                    "successful_runs": 0,
+                    "failed_runs": 0,
+                    "running_runs": 0,
+                    "success_rate": 0.0,
+                },
+            )
+            breakdown["total_runs"] += count
+            total_agent_runs += count
+            total_input_tokens += input_count
+            total_output_tokens += output_count
+            if status == "COMPLETED":
+                breakdown["successful_runs"] += count
+                successful_agent_runs += count
+            elif status == "FAILED":
+                breakdown["failed_runs"] += count
+                failed_agent_runs += count
+            elif status == "RUNNING":
+                breakdown["running_runs"] += count
+                running_agent_runs += count
+
+        for breakdown in agent_breakdown.values():
+            terminal_runs = (
+                int(breakdown["successful_runs"])
+                + int(breakdown["failed_runs"])
+            )
+            breakdown["success_rate"] = _percentage(
+                int(breakdown["successful_runs"]),
+                terminal_runs,
+            )
+
+    total_tokens = total_input_tokens + total_output_tokens
+    agent_terminal_runs = successful_agent_runs + failed_agent_runs
+    return DiscoveryOperationalMetrics(
+        automation_rate=_percentage(converted_mappings, total_mappings),
+        total_mappings=total_mappings,
+        converted_mappings=converted_mappings,
+        pending_mappings=pending_mappings,
+        failed_mappings=failed_mappings,
+        review_required_mappings=review_required_mappings,
+        failure_rate=_percentage(failed_mappings, total_mappings),
+        review_rate=_percentage(review_required_mappings, total_mappings),
+        coverage_percentage=_percentage(discovered_objects, total_mappings),
+        total_objects=total_mappings,
+        total_discovery_objects=total_mappings,
+        discovered_objects=discovered_objects,
+        undiscovered_objects=total_mappings - discovered_objects,
+        overall_agent_success_rate=_percentage(
+            successful_agent_runs,
+            agent_terminal_runs,
+        ),
+        total_agent_runs=total_agent_runs,
+        agent_terminal_runs=agent_terminal_runs,
+        successful_agent_runs=successful_agent_runs,
+        failed_agent_runs=failed_agent_runs,
+        running_agent_runs=running_agent_runs,
+        total_input_tokens=total_input_tokens,
+        total_output_tokens=total_output_tokens,
+        total_tokens=total_tokens,
+        average_tokens_per_mapping=round(
+            total_tokens / total_mappings,
+            1,
+        ) if total_mappings else 0.0,
+        avg_agent_runs_per_mapping=round(
+            total_agent_runs / total_mappings,
+            1,
+        ) if total_mappings else 0.0,
+        mappings_requiring_review=mappings_requiring_review,
+        mappings_not_requiring_review=total_mappings - mappings_requiring_review,
+        review_required_rate=_percentage(
+            mappings_requiring_review,
+            total_mappings,
+        ),
+        agent_breakdown=agent_breakdown,
+    )
 
 
 async def get_discovery_summary(
@@ -693,6 +944,9 @@ async def get_discovery_dashboard(
                 summary_payload.get("total_output_tokens") or 0
             ),
         ),
+        "operational_metrics": (
+            await _discovery_operational_metrics(session, repository_id)
+        ).model_dump(mode="json"),
     }
 
 
@@ -1154,6 +1408,285 @@ def _conversion_workbench_metrics(
     }
 
 
+async def _migration_knowledge_metrics(
+    session: AsyncSession,
+    migration_id: str,
+    repository_id: int,
+    mapping_ids: list[int],
+) -> dict[str, int | float]:
+    """Return repository pattern inventory and migration-scoped RAG reuse."""
+    successful_pattern_ids = set(
+        (
+            await session.scalars(
+                select(KnowledgeBaseETL.id).where(
+                    KnowledgeBaseETL.knowledge_type
+                    == "SUCCESSFUL_CONVERSION",
+                    KnowledgeBaseETL.approval_status == "APPROVED",
+                    or_(
+                        KnowledgeBaseETL.repository_id == repository_id,
+                        KnowledgeBaseETL.repository_id.is_(None),
+                    ),
+                )
+            )
+        ).all()
+    )
+    latest_rag_payload_by_mapping: dict[int, dict[str, Any]] = {}
+    if mapping_ids:
+        rows = (
+            await session.execute(
+                select(
+                    AgentResponseETL.etl_object_id,
+                    AgentResponseETL.response_payload,
+                )
+                .join(
+                    WorkflowRunETL,
+                    WorkflowRunETL.id == AgentResponseETL.workflow_run_id,
+                )
+                .where(
+                    WorkflowRunETL.batch_id == migration_id,
+                    AgentResponseETL.agent_name == "RAG_RETRIEVAL_AGENT",
+                    AgentResponseETL.etl_object_id.in_(mapping_ids),
+                )
+                .order_by(
+                    AgentResponseETL.created_at.desc(),
+                    AgentResponseETL.id.desc(),
+                )
+            )
+        ).all()
+        for etl_object_id, response_payload in rows:
+            if etl_object_id is not None:
+                latest_rag_payload_by_mapping.setdefault(
+                    etl_object_id,
+                    response_payload if isinstance(response_payload, dict) else {},
+                )
+
+    reused_pattern_ids: set[int] = set()
+    contributing_mapping_count = 0
+    for payload in latest_rag_payload_by_mapping.values():
+        if payload.get("contributed_to_prompt") is True:
+            contributing_mapping_count += 1
+        retrieved_items = payload.get("retrieved_items")
+        if not isinstance(retrieved_items, list):
+            continue
+        for item in retrieved_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("knowledge_type") != "SUCCESSFUL_CONVERSION":
+                continue
+            try:
+                knowledge_id = int(item.get("knowledge_id"))
+            except (TypeError, ValueError):
+                continue
+            if knowledge_id in successful_pattern_ids:
+                reused_pattern_ids.add(knowledge_id)
+
+    total_successful_patterns = len(successful_pattern_ids)
+    return {
+        "total_successful_patterns": total_successful_patterns,
+        "knowledge_reuse_rate": _percentage(
+            len(reused_pattern_ids),
+            total_successful_patterns,
+        ),
+        "rag_contribution_rate": _percentage(
+            contributing_mapping_count,
+            len(mapping_ids),
+        ),
+    }
+
+
+async def _latest_rag_retrieval_metrics(
+    session: AsyncSession,
+    migration_id: str,
+    mapping_ids: list[int],
+) -> dict[str, int | float | bool | str]:
+    """Aggregate the latest persisted retrieval audit for each migration mapping."""
+    if not mapping_ids:
+        return {
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "used_for_generation": False,
+            "retrieval_success_rate": 0.0,
+            "retrieval_status": "NO_MIGRATION_MAPPINGS",
+        }
+
+    audits = (
+        await session.scalars(
+            select(RAGRetrievalEventETL)
+            .join(
+                WorkflowRunETL,
+                WorkflowRunETL.id == RAGRetrievalEventETL.workflow_run_id,
+            )
+            .where(
+                WorkflowRunETL.batch_id == migration_id,
+                RAGRetrievalEventETL.etl_object_id.in_(mapping_ids),
+            )
+            .order_by(
+                RAGRetrievalEventETL.created_at.desc(),
+                RAGRetrievalEventETL.id.desc(),
+            )
+        )
+    ).all()
+    latest_by_mapping: dict[int, RAGRetrievalEventETL] = {}
+    for audit in audits:
+        if audit.etl_object_id is not None:
+            latest_by_mapping.setdefault(audit.etl_object_id, audit)
+
+    if not latest_by_mapping:
+        return {
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "used_for_generation": False,
+            "retrieval_success_rate": 0.0,
+            "retrieval_status": "NO_RETRIEVAL_DATA",
+        }
+
+    candidate_count = sum(
+        max(int(audit.candidate_count or 0), 0)
+        for audit in latest_by_mapping.values()
+    )
+    accepted_count = sum(
+        max(int(audit.accepted_count or 0), 0)
+        for audit in latest_by_mapping.values()
+    )
+    return {
+        "candidate_count": candidate_count,
+        "accepted_count": accepted_count,
+        "used_for_generation": any(
+            audit.contributed_to_prompt is True
+            for audit in latest_by_mapping.values()
+        ),
+        "retrieval_success_rate": _percentage(accepted_count, candidate_count),
+        "retrieval_status": "COMPLETED" if candidate_count else "NO_CANDIDATES",
+    }
+
+
+def _rag_automation_metrics(
+    mapping_metrics: list[dict[str, Any]],
+    token_utilization: dict[str, Any],
+    knowledge_metrics: dict[str, Any],
+    retrieval_metrics: dict[str, Any],
+) -> RAGAutomationMetrics:
+    """Combine stored migration economics, token usage, knowledge, and RAG audits."""
+    economics_rows = [
+        item.get("economics")
+        for item in mapping_metrics
+        if isinstance(item.get("economics"), dict)
+        and item["economics"].get("calculation_status") == "CALCULATED"
+    ]
+    manual_hours = round(
+        sum(float(item.get("manual_hours") or 0) for item in economics_rows),
+        2,
+    )
+    manual_cost = round(
+        sum(float(item.get("manual_cost") or 0) for item in economics_rows),
+        2,
+    )
+    effort_saved = round(
+        sum(float(item.get("effort_saved_hours") or 0) for item in economics_rows),
+        2,
+    )
+    cost_saved = round(
+        sum(float(item.get("cost_saved") or 0) for item in economics_rows),
+        2,
+    )
+    prompt_token_rows = [
+        item.get("conversion_prompt_tokens")
+        for item in mapping_metrics
+        if isinstance(item.get("conversion_prompt_tokens"), dict)
+        and "baseline_prompt_tokens" in item["conversion_prompt_tokens"]
+        and "actual_prompt_tokens" in item["conversion_prompt_tokens"]
+    ]
+    baseline_total_tokens = sum(
+        max(int(item.get("baseline_prompt_tokens") or 0), 0)
+        for item in prompt_token_rows
+    )
+    actual_total_tokens = sum(
+        max(int(item.get("actual_prompt_tokens") or 0), 0)
+        for item in prompt_token_rows
+    )
+    token_utilization_saved = baseline_total_tokens - actual_total_tokens
+    full_context_tokens = sum(
+        max(int(item.get("full_context_tokens") or 0), 0)
+        for item in prompt_token_rows
+    )
+    retrieved_context_tokens = sum(
+        max(int(item.get("retrieved_context_tokens") or 0), 0)
+        for item in prompt_token_rows
+    )
+    rag_token_impact = actual_total_tokens - baseline_total_tokens
+    rag_token_impact_status = (
+        "INCREASED_PROMPT_SIZE"
+        if rag_token_impact > 0
+        else "REDUCED_PROMPT_SIZE"
+        if rag_token_impact < 0
+        else "NO_CHANGE"
+    )
+    successful_patterns = max(
+        int(knowledge_metrics.get("total_successful_patterns") or 0),
+        0,
+    )
+    return RAGAutomationMetrics(
+        manual_hours_required=manual_hours,
+        manual_cost=manual_cost,
+        effort_saved_hours=effort_saved,
+        effort_saved_percentage=(
+            round(effort_saved / manual_hours * 100.0, 1)
+            if manual_hours else 0.0
+        ),
+        baseline_total_tokens=baseline_total_tokens,
+        token_utilization_saved=token_utilization_saved,
+        token_reduction_percentage=(
+            round(
+                token_utilization_saved / baseline_total_tokens * 100.0,
+                1,
+            )
+            if baseline_total_tokens else 0.0
+        ),
+        actual_total_tokens=actual_total_tokens,
+        token_savings_status=(
+            "CALCULATED" if prompt_token_rows else "NO_PROMPT_TOKEN_DATA"
+        ),
+        retrieved_context_tokens=retrieved_context_tokens,
+        prompt_compression_savings=(
+            full_context_tokens - retrieved_context_tokens
+            if prompt_token_rows else 0
+        ),
+        rag_token_impact=rag_token_impact,
+        rag_token_impact_status=rag_token_impact_status,
+        cost_saved=cost_saved,
+        cost_saved_percentage=(
+            round(cost_saved / manual_cost * 100.0, 1)
+            if manual_cost else 0.0
+        ),
+        total_successful_patterns=successful_patterns,
+        total_successful_patterns_status="CALCULATED",
+        knowledge_reuse_rate=float(
+            knowledge_metrics.get("knowledge_reuse_rate") or 0.0
+        ),
+        knowledge_reuse_status=(
+            "CALCULATED" if successful_patterns else "NO_SUCCESSFUL_PATTERNS"
+        ),
+        rag_contribution_rate=float(
+            knowledge_metrics.get("rag_contribution_rate") or 0.0
+        ),
+        rag_contribution_status=(
+            "CALCULATED" if mapping_metrics else "NO_MIGRATION_MAPPINGS"
+        ),
+        retrieval_success_rate=float(
+            retrieval_metrics.get("retrieval_success_rate") or 0.0
+        ),
+        retrieval_status=str(
+            retrieval_metrics.get("retrieval_status", "NO_RETRIEVAL_DATA")
+        ),
+        candidate_count=max(int(retrieval_metrics.get("candidate_count") or 0), 0),
+        accepted_count=max(int(retrieval_metrics.get("accepted_count") or 0), 0),
+        used_for_generation=bool(
+            retrieval_metrics.get("used_for_generation", False)
+        ),
+        economics_status="CALCULATED" if economics_rows else "NO_ECONOMICS_DATA",
+    )
+
+
 async def get_migration_dashboard(
     session: AsyncSession,
     migration_id: str,
@@ -1224,6 +1757,8 @@ async def get_migration_dashboard(
         conversion_by_agent = {
             audit.agent_name: audit for audit in conversion_audits
         }
+        rag_audit = conversion_by_agent.get("RAG_RETRIEVAL_AGENT")
+        rag_payload = _rag_api_response(rag_audit) or {}
         conversion_agent = conversion_by_agent.get("CONVERSION_AGENT")
         conversion_critique = conversion_by_agent.get("CRITIQUE_AGENT")
         conversion_payload = (
@@ -1281,8 +1816,54 @@ async def get_migration_dashboard(
             "migration_wave": mapping.migration_wave,
             "overall_status": mapping.migration_status,
             "progress_percentage": progress,
+            "rag": rag_payload or None,
+            "conversion_prompt_tokens": {
+                "baseline_prompt_tokens": conversion_payload.get(
+                    "baseline_prompt_tokens"
+                ),
+                "actual_prompt_tokens": conversion_payload.get(
+                    "actual_prompt_tokens"
+                ),
+                "retrieved_context_tokens": conversion_payload.get(
+                    "retrieved_context_tokens"
+                ),
+                "full_context_tokens": (
+                    max(int(rag_payload.get("context_tokens") or 0), 0)
+                    if rag_payload.get("contributed_to_prompt") is True
+                    else 0
+                ),
+            }
+            if (
+                "baseline_prompt_tokens" in conversion_payload
+                and "actual_prompt_tokens" in conversion_payload
+            )
+            else None,
             **conversion_metrics,
             "stages": {
+                "rag": None if rag_audit is None else {
+                    "status": rag_audit.status,
+                    "result_status": rag_payload.get("status"),
+                    "candidate_count": rag_payload.get("candidate_count", 0),
+                    "eligible_knowledge_count": rag_payload.get(
+                        "eligible_knowledge_count",
+                        0,
+                    ),
+                    "retrieval_count": rag_payload.get("retrieval_count", 0),
+                    "accepted_count": rag_payload.get("accepted_count", 0),
+                    "embedding_input_tokens": rag_payload.get(
+                        "embedding_input_tokens",
+                        rag_audit.input_tokens,
+                    ),
+                    "context_tokens": rag_payload.get("context_tokens", 0),
+                    "contributed_to_prompt": rag_payload.get(
+                        "contributed_to_prompt",
+                        False,
+                    ),
+                    "candidate_scores": rag_payload.get(
+                        "candidate_scores",
+                        [],
+                    ),
+                },
                 "conversion": None if conversion is None else {
                     "workflow_id": conversion.workflow_id,
                     "status": (
@@ -1339,6 +1920,23 @@ async def get_migration_dashboard(
             },
         })
     token_usage = await get_migration_token_utilization(session, migration_id)
+    knowledge_metrics = await _migration_knowledge_metrics(
+        session,
+        migration_id,
+        parent.repository_id,
+        [mapping.id for mapping in mappings],
+    )
+    retrieval_metrics = await _latest_rag_retrieval_metrics(
+        session,
+        migration_id,
+        [mapping.id for mapping in mappings],
+    )
+    rag_automation_metrics = _rag_automation_metrics(
+        result_mappings,
+        token_usage,
+        knowledge_metrics,
+        retrieval_metrics,
+    )
     mapping_progress = [
         int(item.get("progress_percentage") or 0)
         for item in result_mappings
@@ -1372,6 +1970,8 @@ async def get_migration_dashboard(
             "failure_reason": parent.failure_reason,
         },
         "token_utilization": token_usage,
+        "knowledge_metrics": knowledge_metrics,
+        "rag_automation_metrics": rag_automation_metrics.model_dump(mode="json"),
         "mappings": result_mappings,
         "event_log": all_events,
     }
@@ -1594,7 +2194,7 @@ async def get_mapping_conversion(
         "mapping_name": row.object_name,
         "migration_wave": row.migration_wave,
         "migration_status": row.migration_status,
-        "rag": rag.response_payload if rag else None,
+        "rag": _rag_api_response(rag),
         "conversion": conversion.response_payload if conversion else None,
         "critique": critique.response_payload if critique else None,
     }
@@ -1735,6 +2335,7 @@ async def get_conversion_workbench(
         "target": target_artifact,
         **workbench_metrics,
         "recommendations": list(dict.fromkeys(recommendations)),
+        "rag": _rag_api_response(by_agent.get("RAG_RETRIEVAL_AGENT")),
         "conversion": conversion_payload or None,
         "critique": critique_payload or None,
         "artifacts": artifact_payloads,

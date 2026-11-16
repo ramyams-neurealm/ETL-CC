@@ -27,11 +27,8 @@ class UnitTestRenderer:
     ) -> str:
         module_name = re.sub(r"\.py$", "", Path(pyspark_file_name).name)
         source_map = {dataset.name: dataset for dataset in mapping.sources}
-        target_field_map = {
-            field.name: field
-            for target in mapping.targets
-            for field in target.fields
-        }
+        targets = {target.name: target for target in mapping.targets}
+        target_names = list(targets)
         parameter_map = {
             parameter.name: parameter for parameter in mapping.parameters
         }
@@ -75,6 +72,17 @@ class UnitTestRenderer:
                 blocks.append(
                     f"    inputs[{dataset_name!r}] = spark.createDataFrame(rows_{cls._safe_identifier(dataset_name)}, schema_{cls._safe_identifier(dataset_name)})"
                 )
+            target_name = scenario.target_name
+            if target_name is None and len(targets) == 1:
+                target_name = target_names[0]
+            if target_name not in targets:
+                raise ValueError(
+                    f"Scenario {scenario.test_id!r} must name a canonical "
+                    "target_name."
+                )
+            target_field_map = {
+                field.name: field for field in targets[target_name].fields
+            }
             if scenario.parameter_values:
                 values = {
                     item.parameter_name: cls._coerce_parameter(
@@ -89,6 +97,13 @@ class UnitTestRenderer:
                 )
             else:
                 blocks.append("    actual = transform(inputs)")
+            blocks.append("    assert isinstance(actual, dict)")
+            blocks.append(
+                f"    assert set(actual) == set({target_names!r})"
+            )
+            blocks.append(
+                f"    actual = actual[{target_name!r}]"
+            )
             columns = scenario.deterministic_columns
             blocks.append(f"    deterministic_columns = {columns!r}")
             blocks.append(

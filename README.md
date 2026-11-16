@@ -36,6 +36,9 @@ Synthetic graph fixtures are in `runtime_sources/ab_initio_graph/`:
 - `sample_active_customers.mp`: active-customer filter and field reformat.
 - `sample_inventory_reorder.mp`: below-reorder-level filter and calculated
   reorder quantity.
+- `sample_high_complexity_order_analytics.mp`: multi-source order enrichment,
+  joins, lookups, aggregation, ranking, routing, and separate fact/reject
+  targets, designed to exercise the HIGH complexity discovery flow.
 
 Upload one `.mp` file with `POST /api/v1/sources/ab-initio/analyze`, then submit
 its returned `source_id` and `test_token` to `POST /api/v1/discoveries`. The

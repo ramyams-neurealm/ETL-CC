@@ -677,6 +677,41 @@ class DiscoverySummaryResponse(BaseModel):
     total_output_tokens: int
 
 
+class DiscoveryOperationalMetrics(BaseModel):
+    """Repository-scoped operational KPIs for the Discovery dashboard."""
+
+    automation_rate: float = 0.0
+    total_mappings: int = 0
+    converted_mappings: int = 0
+    pending_mappings: int = 0
+    failed_mappings: int = 0
+    review_required_mappings: int = 0
+    failure_rate: float = 0.0
+    review_rate: float = 0.0
+    coverage_percentage: float = 0.0
+    total_objects: int = 0
+    total_discovery_objects: int = 0
+    discovered_objects: int = 0
+    undiscovered_objects: int = 0
+    overall_agent_success_rate: float = 0.0
+    total_agent_runs: int = 0
+    agent_terminal_runs: int = 0
+    successful_agent_runs: int = 0
+    failed_agent_runs: int = 0
+    running_agent_runs: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_tokens: int = 0
+    average_tokens_per_mapping: float = 0.0
+    avg_agent_runs_per_mapping: float = 0.0
+    mappings_requiring_review: int = 0
+    mappings_not_requiring_review: int = 0
+    review_required_rate: float = 0.0
+    agent_breakdown: dict[str, dict[str, int | float]] = Field(
+        default_factory=dict
+    )
+
+
 class MappingDiscoveryDetailsResponse(BaseModel):
     etl_object_id: int
     repository_id: int
@@ -776,6 +811,38 @@ class StartMigrationResponse(BaseModel):
     current_stage: Literal["CONVERSION"] = "CONVERSION"
     mapping_count: int
     message: str
+
+
+class RAGAutomationMetrics(BaseModel):
+    """Persisted-data metrics used by the migration RAG savings dashboard."""
+
+    manual_hours_required: float = 0.0
+    manual_cost: float = 0.0
+    effort_saved_hours: float = 0.0
+    effort_saved_percentage: float = 0.0
+    baseline_total_tokens: int = 0
+    token_utilization_saved: int = 0
+    token_reduction_percentage: float = 0.0
+    actual_total_tokens: int = 0
+    token_savings_status: str = "NO_PROMPT_TOKEN_DATA"
+    retrieved_context_tokens: int = 0
+    prompt_compression_savings: int = 0
+    rag_token_impact: int = 0
+    rag_token_impact_status: str = "NO_CHANGE"
+    cost_saved: float = 0.0
+    cost_saved_percentage: float = 0.0
+    total_successful_patterns: int = 0
+    total_successful_patterns_status: str = "CALCULATED"
+    knowledge_reuse_rate: float = 0.0
+    knowledge_reuse_status: str = "NO_SUCCESSFUL_PATTERNS"
+    rag_contribution_rate: float = 0.0
+    rag_contribution_status: str = "NO_MIGRATION_MAPPINGS"
+    retrieval_success_rate: float = 0.0
+    retrieval_status: str = "NO_RETRIEVAL_DATA"
+    candidate_count: int = 0
+    accepted_count: int = 0
+    used_for_generation: bool = False
+    economics_status: str = "NO_ECONOMICS_DATA"
 
 
 class StartConversionRequest(BaseModel):

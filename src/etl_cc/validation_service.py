@@ -21,6 +21,9 @@ from etl_cc.connectors import load_postgresql_table
 from etl_cc.security import validation_credential_cipher
 from etl_cc.models import ValidationDatabaseConnectionETL
 from etl_cc.database import SessionFactory
+from etl_cc.knowledge_capture_service import (
+    capture_successful_conversion_knowledge,
+)
 from etl_cc.logging_config import banner, configure_logging, log_event, log_exception, metric, stage_completed, stage_failed, stage_started, stage_warning
 from etl_cc.models import (
     AgentResponseETL,
@@ -561,6 +564,14 @@ async def _process(workflow_id: int) -> None:
                 },
             )
             await session.commit()
+            if passed:
+                await capture_successful_conversion_knowledge(
+                    session,
+                    workflow,
+                    mapping,
+                    result.model_dump(mode="json"),
+                    trigger="VALIDATION",
+                )
 
         workflow.current_stage = "VALIDATION_COMPLETED"
         workflow.job_status = "COMPLETED" if all_passed else "FAILED"

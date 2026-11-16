@@ -21,6 +21,9 @@ from etl_cc.agents.deployment_agent import (
 )
 from etl_cc.config import settings
 from etl_cc.database import SessionFactory
+from etl_cc.knowledge_capture_service import (
+    capture_successful_conversion_knowledge,
+)
 from etl_cc.logging_config import configure_logging, log_exception
 from etl_cc.models import (
     AgentResponseETL,
@@ -330,6 +333,14 @@ async def _deploy_mapping(session, migration, validation, mapping, index, total,
         event_payload=_event_payload(migration, mapping, **result.model_dump(mode="json")),
         actor_type="SYSTEM",
     ))
+    if success:
+        await capture_successful_conversion_knowledge(
+            session,
+            validation,
+            mapping,
+            evidence,
+            trigger="DEPLOYMENT",
+        )
     return success
 
 

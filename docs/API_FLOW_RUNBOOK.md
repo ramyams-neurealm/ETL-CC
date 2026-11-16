@@ -181,6 +181,14 @@ workbench metrics. These sections are scoped to that mapping's conversion
 workflow; `quality.coverage_status` remains `PENDING_VALIDATION` until a
 validation-specific coverage metric is available.
 
+RAG diagnostics are returned in `mappings[].rag` and `mappings[].stages.rag`
+from the migration dashboard, and in `rag` from the conversion workbench and
+mapping-conversion responses. The detailed result includes eligible knowledge
+count, candidate scores and rejection reasons, retrieval thresholds, embedding
+input tokens, and whether knowledge contributed to the conversion prompt.
+`agent_performance.by_agent.RAG_RETRIEVAL_AGENT` reports embedding input tokens;
+these are distinct from chat-completion tokens.
+
 Generated PySpark transformations accept the named source DataFrames and an
 optional keyword-only `parameters` dictionary. A Databricks job wrapper should
 read widget/job parameter values and pass them to

@@ -348,7 +348,7 @@ All settings live in `src/etl_cc/config.py` (class `Settings`). Values are read 
 | Conversion / RAG | `CONVERSION_MAX_ATTEMPTS` (2), `RAG_*` (embedding model text-embedding-3-small, 1536 dims, similarity thresholds 0.50 / 0.65) | |
 | Validation | `MINIMUM_FUNCTIONAL_PARITY` (**0.50**), `VALIDATION_CONFIDENCE_THRESHOLD` (0.60), `VALIDATION_TEST_TIMEOUT_SECONDS` (300), simulation and upload limits | Each request can set its own parity (API default 0.95). See §11. |
 | Deployment | `GIT_DEPLOYMENT_REPOSITORY_URL`, `GIT_DEPLOYMENT_ACCESS_TOKEN`, `GIT_DEPLOYMENT_BASE_BRANCH` (main), `GIT_DEPLOYMENT_REPOSITORY_PATH` (migrations), `GIT_DEPLOYMENT_BRANCH_PREFIX` (neuflow), `GIT_DEPLOYMENT_CREATE_PULL_REQUEST` (false), `AUTO_DEPLOY_AFTER_VALIDATION` (true) | Used by **automatic** deployment only. Manual deployments use the saved target. |
-| Runtime | `WORKER_POLL_SECONDS` (2), `MEMORY_WORKSPACE_ROOT` (/dev/shm/etl_cc), `ETL_CC_LOG_PATH` | Log default: `/home/authuser/dev/chatbots/ETL_CC/logs/etl_cc.log` on Linux, `<project>/logs/etl_cc.log` elsewhere. |
+| Runtime | `WORKER_POLL_SECONDS` (2), `MEMORY_WORKSPACE_ROOT` (/dev/shm/etl_cc), `ETL_CC_LOG_PATH`, `ETL_CC_LOG_LEVEL` (INFO; set DEBUG for detailed diagnostics) | Log default: `/home/authuser/dev/chatbots/ETL_CC/logs/etl_cc.log` on Linux, `<project>/logs/etl_cc.log` elsewhere. |
 
 ---
 
@@ -471,7 +471,15 @@ All of these must agree. For example, if `transform` gains a parameter, update t
 1. Insert rows into `knowledge_base_etl` with `approval_status='APPROVED'` and `metadata_payload` keys `source_vendor`, `target_framework` and `transformation_types`.
 2. Run `python -m etl_cc.rag_backfill` to embed them.
 
-Only APPROVED rows with `embedding_status='COMPLETED'` are retrieved.
+Only rows matching the requested repository (or global rows) are eligible when
+they are APPROVED, have `embedding_status='COMPLETED'`, contain a vector for the
+configured embedding model, and have a current embedding content hash. One row
+in `knowledge_base_etl` is one knowledge item; each conversion attempt creates
+a separate retrieval event. Check the migration dashboard's `mappings[].rag`
+or the conversion workbench's `rag` object for eligible counts, candidate
+scores, rejection reasons, thresholds, and embedding-token usage. The RAG agent
+does not create knowledge-base entries; entries must be populated before the
+backfill.
 
 ### 9.8 Before you commit, check that…
 - [ ] `pytest tests -q` passes.

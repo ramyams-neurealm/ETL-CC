@@ -43,7 +43,7 @@ class CritiqueAgent:
     PROMPT_VERSION = "1.5.0"
 
     UNIT_TEST_SEMANTICS_GUIDANCE = """Review UNIT_TEST expected rows against the complete canonical operation sequence, not just the generated PySpark. For AGGREGATE/GROUP BY, Spark retains null grouping keys as a null-key group unless canonical upstream evidence explicitly filters them out. SUM ignores null measure values within a group but does not remove the group; an all-null group has a null SUM. A unit-test expectation that drops a null-key group without a grounded exclusion rule is a HIGH severity UNIT_TEST_SEMANTICS issue and requires revision."""
-    UNIT_TEST_DECIMAL_GUIDANCE = """Review expected test value types against the canonical target schema. Spark returns DecimalType values as decimal.Decimal; expected decimal outputs must use Decimal from a string, never a float literal. A DecimalType assertion comparing a collected Decimal to a float is a HIGH severity UNIT_TEST_NUMERIC_TYPE issue and requires revision."""
+    UNIT_TEST_DECIMAL_GUIDANCE = """For every DecimalType output, require expected pytest dataset values to be decimal.Decimal values constructed from string literals, such as Decimal('50.00') or Decimal('0.00'). Never accept raw Python float/double literals such as 50.0 or 12.5 in expected values. Spark returns DecimalType values as decimal.Decimal; a DecimalType assertion comparing a collected Decimal to a float is a HIGH severity UNIT_TEST_NUMERIC_TYPE issue and requires revision."""
 
     def __init__(self, source_vendor: str = "INFORMATICA") -> None:
         self.source_vendor = source_vendor
@@ -138,6 +138,11 @@ Return structured critique only."""
             for item in conversion.generated_files
         }
         code = (files.get("PYSPARK_CODE").content if files.get("PYSPARK_CODE") else "")
+        unit_test = (
+            files.get("UNIT_TEST").content
+            if files.get("UNIT_TEST")
+            else ""
+        )
         upper_code = code.upper()
         target_fields = {
             field.name.upper()
@@ -201,7 +206,20 @@ Return structured critique only."""
                     "LINEAGE COVERAGE",
                 ))
             )
-            if null_only_finding or projection_only_finding:
+            matching_risk_score_default = (
+                issue.category.upper() == "UNIT_TEST_SEMANTICS"
+                and "RISK_SCORE" in text
+                and "NULL" in text
+                and CritiqueAgent._has_matching_null_risk_score_default(
+                    code,
+                    unit_test,
+                )
+            )
+            if (
+                null_only_finding
+                or projection_only_finding
+                or matching_risk_score_default
+            ):
                 continue
             retained.append(issue)
 
@@ -216,6 +234,165 @@ Return structured critique only."""
             result.business_rule_coverage = 1.0
             result.lineage_coverage = 1.0
         return result
+
+    @staticmethod
+    def _has_matching_null_risk_score_default(
+        code: str,
+        unit_test: str,
+    ) -> bool:
+        """Check that null RISK_SCORE is coalesced and asserted as zero."""
+        def sequence_elements(node: ast.expr | None) -> list[ast.expr]:
+            return node.elts if isinstance(node, (ast.List, ast.Tuple)) else []
+
+        def is_zero(node: ast.expr) -> bool:
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)
+            ):
+                return node.value == 0
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "Decimal"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                try:
+                    return float(node.args[0].value) == 0
+                except ValueError:
+                    return False
+            return False
+
+        try:
+            code_tree = ast.parse(code)
+            test_tree = ast.parse(unit_test)
+        except SyntaxError:
+            return False
+
+        has_zero_coalesce = any(
+            isinstance(node, ast.Call)
+            and (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id.lower() == "coalesce"
+                )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr.lower() == "coalesce"
+                )
+            )
+            and any(
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and child.value.upper() == "RISK_SCORE"
+                for child in ast.walk(node)
+            )
+            and any(
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, (int, float))
+                and not isinstance(child.value, bool)
+                and child.value == 0
+                for child in ast.walk(node)
+            )
+            for node in ast.walk(code_tree)
+        )
+        if not has_zero_coalesce:
+            return False
+
+        for function in (
+            node for node in ast.walk(test_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            assignments: dict[str, ast.expr] = {}
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Assign):
+                    continue
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        assignments[target.id] = node.value
+
+            try:
+                expected_columns = ast.literal_eval(
+                    assignments.get("deterministic_columns")
+                )
+            except (TypeError, ValueError):
+                continue
+            expected_rows = sequence_elements(
+                assignments.get("expected_rows")
+            )
+            if not expected_columns or not expected_rows:
+                continue
+            risk_score_output_index = next(
+                (
+                    index
+                    for index, name in enumerate(expected_columns)
+                    if isinstance(name, str) and name.upper() == "RISK_SCORE"
+                ),
+                None,
+            )
+            if risk_score_output_index is None:
+                continue
+
+            for schema_name, schema_expression in assignments.items():
+                if not schema_name.startswith("schema_"):
+                    continue
+                rows_expression = assignments.get(
+                    schema_name.replace("schema_", "rows_", 1)
+                )
+                if rows_expression is None:
+                    continue
+                schema_arguments = (
+                    schema_expression.args
+                    if isinstance(schema_expression, ast.Call)
+                    and isinstance(schema_expression.func, ast.Name)
+                    and schema_expression.func.id == "StructType"
+                    else []
+                )
+                schema_items = sequence_elements(
+                    schema_arguments[0] if schema_arguments else None
+                )
+                schema_fields = [
+                    item.args[0].value
+                    for item in schema_items
+                    if (
+                        isinstance(item, ast.Call)
+                        and isinstance(item.func, ast.Name)
+                        and item.func.id == "StructField"
+                        and item.args
+                        and isinstance(item.args[0], ast.Constant)
+                        and isinstance(item.args[0].value, str)
+                    )
+                ]
+                if "RISK_SCORE" not in [name.upper() for name in schema_fields]:
+                    continue
+                risk_score_input_index = next(
+                    index
+                    for index, name in enumerate(schema_fields)
+                    if name.upper() == "RISK_SCORE"
+                )
+                input_rows = sequence_elements(rows_expression)
+                has_null_input = any(
+                    len(row_values) > risk_score_input_index
+                    and isinstance(
+                        row_values[risk_score_input_index],
+                        ast.Constant,
+                    )
+                    and row_values[risk_score_input_index].value is None
+                    for row in input_rows
+                    for row_values in [sequence_elements(row)]
+                )
+                if not has_null_input:
+                    continue
+                if any(
+                    len(row_values) > risk_score_output_index
+                    and is_zero(row_values[risk_score_output_index])
+                    for row in expected_rows
+                    for row_values in [sequence_elements(row)]
+                ):
+                    return True
+        return False
 
     @staticmethod
     def deterministic_checks(

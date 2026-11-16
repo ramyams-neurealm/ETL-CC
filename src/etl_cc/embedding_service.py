@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 from openai import OpenAI
@@ -12,26 +13,50 @@ class EmbeddingService:
     MODEL_NAME = "text-embedding-3-small"
 
     async def embed_text(self, text: str, operation_name: str) -> list[float]:
+        embedding, _ = await self.embed_text_with_usage(text, operation_name)
+        return embedding
+
+    async def embed_text_with_usage(
+        self,
+        text: str,
+        operation_name: str,
+    ) -> tuple[list[float], int]:
         normalized = " ".join(str(text or "").split())
         if not normalized:
             raise ValueError("Embedding text cannot be empty.")
         key = await asyncio.to_thread(key_vault_service.get_openai_key, operation_name)
-        def invoke() -> list[float]:
+
+        def invoke() -> tuple[list[float], int]:
             client = OpenAI(api_key=key)
             response = client.embeddings.create(
                 model=settings.rag_embedding_deployment,
                 input=normalized,
                 dimensions=settings.rag_embedding_dimensions,
             )
-            return list(response.data[0].embedding)
-        vector = await asyncio.to_thread(invoke)
+            usage = getattr(response, "usage", None)
+            input_tokens = int(
+                getattr(usage, "prompt_tokens", 0)
+                or getattr(usage, "total_tokens", 0)
+                or 0
+            )
+            return list(response.data[0].embedding), input_tokens
+
+        vector, input_tokens = await asyncio.to_thread(invoke)
         if len(vector) != settings.rag_embedding_dimensions:
             raise ValueError(f"Embedding dimension {len(vector)} does not match configured {settings.rag_embedding_dimensions}.")
-        return vector
+        return vector, input_tokens
 
     @staticmethod
     def knowledge_text(row: Any) -> str:
         metadata = row.metadata_payload or {}
+        embedding_document = metadata.get("embedding_document")
+        if embedding_document is not None:
+            return json.dumps(
+                embedding_document,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
         return "\n".join([
             f"Knowledge type: {row.knowledge_type}",
             f"Title: {row.title}",

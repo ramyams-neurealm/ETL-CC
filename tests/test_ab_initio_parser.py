@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from etl_cc.ab_initio_parser import AbInitioGraphParser, AbInitioGraphParserError
+from etl_cc.agents.discovery_agent import DiscoveryAgent
 from etl_cc.agents.matchflow_comparator import MatchFlowComparator
 from etl_cc.agents.unit_test_specification import (
     InputDatasetSpecification,
@@ -87,6 +88,41 @@ def test_additional_ab_initio_samples_have_complete_canonical_target_lineage(
     assert {field.name for field in mapping.targets[0].fields} == target_fields
     assert target_links == target_fields
     assert not mapping.source_metadata["unsupported_constructs"]
+
+
+def test_low_complexity_ab_initio_sample_has_supported_mapping_and_low_score():
+    fixture = SAMPLE_FIXTURES / "sample_low_complexity_active_customers.mp"
+    mapping = AbInitioGraphParser().parse_file(fixture)[0]
+    agent = DiscoveryAgent()
+    risks = agent._derive_risks(mapping)
+    unsupported = agent._unsupported_constructs(mapping)
+
+    score, level, _ = agent._calculate_complexity(mapping, risks, unsupported)
+
+    assert mapping.mapping_name == "g_copy_active_customers"
+    assert [dataset.name for dataset in mapping.sources] == ["SRC_ACTIVE_CUSTOMERS"]
+    assert [dataset.name for dataset in mapping.targets] == ["TGT_ACTIVE_CUSTOMERS"]
+    assert level == "LOW"
+    assert score == 12
+    assert unsupported == []
+    assert risks == []
+
+
+def test_high_complexity_ab_initio_sample_scores_as_high_without_unsupported_constructs():
+    fixture = SAMPLE_FIXTURES / "sample_high_complexity_order_analytics.mp"
+    mapping = AbInitioGraphParser().parse_file(fixture)[0]
+    agent = DiscoveryAgent()
+    risks = agent._derive_risks(mapping)
+    unsupported = agent._unsupported_constructs(mapping)
+
+    score, level, _ = agent._calculate_complexity(mapping, risks, unsupported)
+
+    assert len(mapping.sources) == 4
+    assert len(mapping.targets) == 2
+    assert len(mapping.transformations) == 13
+    assert level == "HIGH"
+    assert 56 <= score <= 80
+    assert unsupported == []
 
 
 def test_ab_initio_parser_rejects_other_json_formats():

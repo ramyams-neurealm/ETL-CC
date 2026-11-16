@@ -2076,6 +2076,7 @@ def sanitized_spark_environment():
 class TargetExecutionResult(BaseModel):
     status: Literal["PASSED", "FAILED", "SKIPPED"]
     rows: list[dict[str, Any]] = Field(default_factory=list)
+    target_rows: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     row_count: int = 0
     stdout: str = ""
     stderr: str = ""
@@ -2159,13 +2160,24 @@ spark = SparkSession.builder.master('local[1]').appName('neuflow-validation').ge
 try:
     frames = {
         name: spark.createDataFrame(
-            convert_rows(rows, schemas_payload[name]),
-            schema=schema(schemas_payload[name]),
+            convert_rows(rows, schemas_payload['sources'][name]),
+            schema=schema(schemas_payload['sources'][name]),
         )
         for name, rows in inputs_payload.items()
     }
     output = transform(frames)
-    json.dump([item.asDict(recursive=True) for item in output.collect()], open(output_path, 'w', encoding='utf-8'), default=str)
+    if not isinstance(output, dict):
+        raise TypeError('transform must return a dictionary keyed by canonical target dataset name.')
+    target_names = schemas_payload['targets']
+    if set(output) != set(target_names):
+        raise ValueError(f'transform returned target keys {sorted(output)}; expected {sorted(target_names)}.')
+    target_rows = {}
+    for name in target_names:
+        dataframe = output[name]
+        if not hasattr(dataframe, 'collect'):
+            raise TypeError(f'target {name!r} is not a Spark DataFrame.')
+        target_rows[name] = [item.asDict(recursive=True) for item in dataframe.collect()]
+    json.dump(target_rows, open(output_path, 'w', encoding='utf-8'), default=str)
 finally:
     spark.stop()
 """
@@ -2178,8 +2190,14 @@ finally:
                 output_path, harness_path = directory / "output.json", directory / "harness.py"
                 input_path.write_text(json.dumps(input_datasets, default=str), encoding="utf-8")
                 schemas = {
-                    dataset.name: [field.model_dump(mode="json") for field in dataset.fields]
-                    for dataset in mapping.sources
+                    "sources": {
+                        dataset.name: [
+                            field.model_dump(mode="json")
+                            for field in dataset.fields
+                        ]
+                        for dataset in mapping.sources
+                    },
+                    "targets": [dataset.name for dataset in mapping.targets],
                 }
                 schema_path.write_text(json.dumps(schemas, default=str), encoding="utf-8")
                 harness_path.write_text(self.HARNESS, encoding="utf-8")
@@ -2226,8 +2244,20 @@ finally:
                 )
                 if completed.returncode != 0:
                     return TargetExecutionResult(status="FAILED", stdout=completed.stdout[-10000:], stderr=completed.stderr[-10000:], error_message=(completed.stderr or completed.stdout)[-4000:])
-                output = json.loads(output_path.read_text(encoding="utf-8"))
-                return TargetExecutionResult(status="PASSED", rows=output, row_count=len(output), stdout=completed.stdout[-10000:], stderr=completed.stderr[-10000:])
+                target_rows = json.loads(output_path.read_text(encoding="utf-8"))
+                rows = (
+                    next(iter(target_rows.values()))
+                    if len(target_rows) == 1
+                    else []
+                )
+                return TargetExecutionResult(
+                    status="PASSED",
+                    rows=rows,
+                    target_rows=target_rows,
+                    row_count=sum(len(items) for items in target_rows.values()),
+                    stdout=completed.stdout[-10000:],
+                    stderr=completed.stderr[-10000:],
+                )
         except subprocess.TimeoutExpired:
             return TargetExecutionResult(status="FAILED", error_message=f"Target execution exceeded {timeout} seconds.")
         except Exception as exc:

@@ -87,6 +87,7 @@ class UnitTestScenario(BaseModel):
     model_config = ConfigDict(extra="forbid")
     test_id: str
     title: str
+    target_name: str | None = None
     category: Literal[
         "HAPPY_PATH",
         "NEGATIVE",
@@ -147,6 +148,7 @@ class UnitTestSpecificationValidator:
             )
 
         sources = {dataset.name: dataset for dataset in mapping.sources}
+        targets = {target.name: target for target in mapping.targets}
         target_fields = {
             field.name: field
             for target in mapping.targets
@@ -173,11 +175,36 @@ class UnitTestSpecificationValidator:
                 and cls._CLOCK.search(str(parameter.default_value or ""))
             )
         }
-        runtime_fields = cls.runtime_fields(mapping)
         seen_ids: set[str] = set()
+        covered_targets: set[str] = set()
 
         for scenario in specification.scenarios:
             prefix = f"Scenario {scenario.test_id}:"
+            if scenario.target_name is None and len(targets) == 1:
+                scenario.target_name = next(iter(targets))
+            target = targets.get(scenario.target_name or "")
+            if target is None:
+                if scenario.target_name is None:
+                    errors.append(
+                        f"{prefix} target_name is required when the mapping has "
+                        "multiple canonical targets."
+                    )
+                else:
+                    errors.append(
+                        f"{prefix} target_name {scenario.target_name!r} is not "
+                        "a canonical target dataset."
+                    )
+                scenario_target_fields = target_fields
+            else:
+                covered_targets.add(target.name)
+                scenario_target_fields = {
+                    field.name: field for field in target.fields
+                }
+            scenario_runtime_fields = cls.runtime_fields(
+                mapping,
+                target_name=target.name if target else None,
+            )
+
             if scenario.test_id in seen_ids:
                 errors.append(f"{prefix} duplicate test_id.")
             seen_ids.add(scenario.test_id)
@@ -301,7 +328,9 @@ class UnitTestSpecificationValidator:
 
             expected_dicts = [row.as_dict() for row in scenario.expected_rows]
             expected_fields = {key for row in expected_dicts for key in row}
-            unknown_expected = sorted(expected_fields - set(target_fields))
+            unknown_expected = sorted(
+                expected_fields - set(scenario_target_fields)
+            )
             if unknown_expected:
                 errors.append(
                     f"{prefix} expected rows contain unknown target field(s): "
@@ -309,8 +338,10 @@ class UnitTestSpecificationValidator:
                 )
 
             deterministic = set(scenario.deterministic_columns)
-            unknown_deterministic = sorted(deterministic - set(target_fields))
-            prohibited = sorted(deterministic & runtime_fields)
+            unknown_deterministic = sorted(
+                deterministic - set(scenario_target_fields)
+            )
+            prohibited = sorted(deterministic & scenario_runtime_fields)
             if unknown_deterministic:
                 errors.append(
                     f"{prefix} unknown deterministic column(s): "
@@ -340,14 +371,16 @@ class UnitTestSpecificationValidator:
                 )
 
             declared_runtime = {item.column_name for item in scenario.runtime_columns}
-            unknown_runtime = sorted(declared_runtime - runtime_fields)
+            unknown_runtime = sorted(
+                declared_runtime - scenario_runtime_fields
+            )
             if unknown_runtime:
                 errors.append(
                     f"{prefix} column(s) are not grounded in a nondeterministic "
                     f"clock expression: {', '.join(unknown_runtime)}."
                 )
             for expectation in scenario.runtime_columns:
-                field = target_fields.get(expectation.column_name)
+                field = scenario_target_fields.get(expectation.column_name)
                 if field is None:
                     continue
                 expected_type = canonical_temporal_family(field.data_type)
@@ -361,12 +394,20 @@ class UnitTestSpecificationValidator:
                         f"{prefix} runtime column {expectation.column_name} must "
                         f"declare type {expected_type!r}."
                     )
-            undeclared_runtime = sorted(runtime_fields - declared_runtime)
+            undeclared_runtime = sorted(
+                scenario_runtime_fields - declared_runtime
+            )
             if undeclared_runtime:
                 errors.append(
                     f"{prefix} missing runtime expectation(s): "
                     f"{', '.join(undeclared_runtime)}."
                 )
+        missing_targets = sorted(set(targets) - covered_targets)
+        if missing_targets:
+            errors.append(
+                "Unit-test scenarios must cover every canonical target dataset; "
+                "missing: " + ", ".join(missing_targets) + "."
+            )
         return errors
 
     @classmethod
@@ -436,21 +477,34 @@ class UnitTestSpecificationValidator:
             }
             return next(iter(origins)) if len(origins) == 1 else None
 
-        target_parameter_fields: dict[str, str] = {}
+        target_parameter_fields: dict[str, dict[str, str]] = {}
         for target in mapping.targets:
             for field in target.fields:
                 origin = parameter_origin((target.name, field.name), set())
                 if origin is not None:
-                    target_parameter_fields[field.name] = origin
+                    target_parameter_fields.setdefault(target.name, {})[
+                        field.name
+                    ] = origin
         if not target_parameter_fields:
             return
 
         for scenario in specification.scenarios:
+            target_name = scenario.target_name
+            if target_name is None and len(mapping.targets) == 1:
+                target_name = mapping.targets[0].name
+            scenario_target_parameter_fields = target_parameter_fields.get(
+                target_name or "",
+                {},
+            )
+            if not scenario_target_parameter_fields:
+                continue
             supplied = {
                 item.parameter_name.casefold(): item
                 for item in scenario.parameter_values
             }
-            for parameter_name in set(target_parameter_fields.values()):
+            for parameter_name in set(
+                scenario_target_parameter_fields.values()
+            ):
                 parameter = parameters[parameter_name]
                 if parameter_name in supplied:
                     continue
@@ -471,19 +525,23 @@ class UnitTestSpecificationValidator:
                 supplied[parameter_name] = value
 
             deterministic = list(dict.fromkeys(scenario.deterministic_columns))
-            for field_name, parameter_name in target_parameter_fields.items():
+            for field_name, parameter_name in (
+                scenario_target_parameter_fields.items()
+            ):
                 if supplied.get(parameter_name) is not None and field_name not in deterministic:
                     deterministic.append(field_name)
             scenario.runtime_columns = [
                 item
                 for item in scenario.runtime_columns
-                if item.column_name not in target_parameter_fields
+                if item.column_name not in scenario_target_parameter_fields
             ]
 
             expected_rows = []
             for row in scenario.expected_rows:
                 cells = {cell.field_name: cell for cell in row.cells}
-                for field_name, parameter_name in target_parameter_fields.items():
+                for field_name, parameter_name in (
+                    scenario_target_parameter_fields.items()
+                ):
                     parameter_value = supplied.get(parameter_name)
                     if parameter_value is None:
                         continue
@@ -498,7 +556,12 @@ class UnitTestSpecificationValidator:
             scenario.deterministic_columns = deterministic
 
     @classmethod
-    def runtime_fields(cls, mapping: CanonicalMapping) -> set[str]:
+    def runtime_fields(
+        cls,
+        mapping: CanonicalMapping,
+        *,
+        target_name: str | None = None,
+    ) -> set[str]:
         """Resolve target fields backed by clock expressions in the mapping.
 
         Runtime expressions frequently pass through Filter, Router, Joiner, or
@@ -558,8 +621,13 @@ class UnitTestSpecificationValidator:
                     return True
             return False
 
+        targets = [
+            target
+            for target in mapping.targets
+            if target_name is None or target.name == target_name
+        ]
         runtime_targets: set[str] = set()
-        for target in mapping.targets:
+        for target in targets:
             for field in target.fields:
                 if is_runtime_origin(target.name, field.name, set()):
                     runtime_targets.add(field.name)
@@ -590,7 +658,7 @@ class UnitTestSpecificationValidator:
             "INPUT/OUTPUT",
             "OUTPUT/INPUT",
         }
-        for target in mapping.targets:
+        for target in targets:
             for field in target.fields:
                 target_node = (target.name, field.name)
                 if field.name in runtime_targets or incoming.get(target_node):
