@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from etl_cc.config import settings
+from etl_cc.complexity import normalize_transformation_category
 from etl_cc.economics import (
     calculate_conversion_economics,
     calculate_discovery_economics,
@@ -74,7 +75,13 @@ from etl_cc.security import (
     credential_cipher,
     verify_connection_test_token,
 )
-from etl_cc.source_store import create_source, create_source_package, load_manifest, update_manifest
+from etl_cc.source_store import (
+    create_source,
+    create_source_package,
+    load_content,
+    load_manifest,
+    update_manifest,
+)
 from etl_cc.xml_package import expand_uploads, merge_xml_files, object_summary
 
 
@@ -279,12 +286,20 @@ async def start_discovery(
         if request.scope_type == "SELECTED_MAPPINGS"
         else []
     )
+    source_content = None
+    if manifest["connection_type"] in {
+        "XML_UPLOAD",
+        "DSX_UPLOAD",
+        "AB_INITIO_GRAPH_UPLOAD",
+    }:
+        source_content = await load_content(session, request.source_id)
     repository = RepositoryETL(
         repository_name=manifest["connection_name"],
         source_type=manifest["product_code"],
         connection_type=manifest["connection_type"],
         environment=manifest["environment"],
         connection_config={**manifest["config"], "source_id": request.source_id},
+        source_content=source_content,
         credential_ciphertext=manifest.get("credential_ciphertext"),
         credential_algorithm="FERNET" if manifest.get("credential_ciphertext") else None,
         credential_key_version=settings.etl_credential_key_version if manifest.get("credential_ciphertext") else None,
@@ -780,7 +795,13 @@ async def get_discovery_summary(
             ETLObjectETL.repository_id == repository_id
         )
     )).all())
-    distribution = {"LOW": 0, "MEDIUM": 0, "HIGH": 0, "UNKNOWN": 0}
+    distribution = {
+        "LOW": 0,
+        "MEDIUM": 0,
+        "HIGH": 0,
+        "VERY_HIGH": 0,
+        "UNKNOWN": 0,
+    }
     ready = review_required = blocked = cycles = discovered = 0
     input_tokens = output_tokens = 0
     for row in rows:
@@ -950,6 +971,91 @@ async def get_discovery_dashboard(
     }
 
 
+def _legacy_complexity_details(payload: dict[str, Any]) -> dict[str, Any]:
+    summary = payload.get("transformation_summary") or {}
+    transformation_types = summary.get("transformation_types") or {}
+    category_keys = {
+        "LOOKUP": "lookups",
+        "JOIN": "joins",
+        "AGGREGATION": "aggregations",
+        "FILTER": "filters",
+        "SORT": "sorts",
+        "STORED_PROCEDURE": "stored_procedures",
+        "CUSTOM_CODE": "custom_code",
+        "SQL": "sql",
+        "OTHER": "other_transformations",
+        "UNKNOWN": "unknown_transformations",
+    }
+    category_counts = {key: 0 for key in category_keys.values()}
+    for transformation_type, raw_count in transformation_types.items():
+        try:
+            count = int(raw_count or 0)
+        except (TypeError, ValueError):
+            continue
+        category = normalize_transformation_category(transformation_type)
+        category_counts[category_keys[category]] += count
+
+    def evidence(value: Any, source: str) -> dict[str, Any]:
+        return {
+            "value": value,
+            "status": "OBSERVED" if value is not None else "UNAVAILABLE",
+            "evidence": [source] if value is not None else [],
+        }
+
+    factors = {
+        "source_count": evidence(
+            summary.get("source_count"), "transformation_summary.source_count"
+        ),
+        "target_count": evidence(
+            summary.get("target_count"), "transformation_summary.target_count"
+        ),
+        "stage_count": evidence(None, ""),
+        "transformation_count": evidence(
+            summary.get("transformation_count"),
+            "transformation_summary.transformation_count",
+        ),
+        "parameters": evidence(
+            summary.get("parameter_count"),
+            "transformation_summary.parameter_count",
+        ),
+        "dependencies": evidence(None, ""),
+        "unsupported_constructs": evidence(
+            len(payload["unsupported_constructs"])
+            if "unsupported_constructs" in payload
+            else None,
+            "discovery_analysis.unsupported_constructs",
+        ),
+        "dynamic_sql": evidence(None, ""),
+    }
+    type_status = "OBSERVED" if transformation_types else "UNAVAILABLE"
+    for key, count in category_counts.items():
+        factors[key] = {
+            "value": count if type_status == "OBSERVED" else None,
+            "status": type_status,
+            "evidence": ["transformation_summary.transformation_types"]
+            if type_status == "OBSERVED"
+            else [],
+        }
+
+    reasons = payload.get("complexity_reasons", [])
+    return {
+        "version": payload.get("complexity_version") or "legacy",
+        "score": payload.get("complexity_score"),
+        "level": payload.get("complexity"),
+        "factors": factors,
+        "contributions": {},
+        "risk_factors": payload.get("risks", []),
+        "reasons": reasons,
+        "reason": " ".join(str(reason) for reason in reasons)
+        or "A detailed factor breakdown is unavailable for this legacy discovery result.",
+        "evidence_coverage": round(
+            sum(item["status"] != "UNAVAILABLE" for item in factors.values())
+            / max(len(factors), 1),
+            3,
+        ),
+    }
+
+
 async def get_mapping_discovery_details(
     session: AsyncSession,
     etl_object_id: int,
@@ -963,7 +1069,22 @@ async def get_mapping_discovery_details(
         agent_name="DISCOVERY_AGENT",
     )
     payload = agent.response_payload if agent else {}
+    if not payload:
+        payload = (row.source_definition or {}).get("discovery_analysis", {})
+    stored_breakdown = getattr(row, "complexity_breakdown", None)
+    complexity_details = (
+        stored_breakdown
+        if isinstance(stored_breakdown, dict) and stored_breakdown
+        else payload.get("complexity_details") or {}
+    )
+    if not complexity_details:
+        complexity_details = _legacy_complexity_details(payload)
     _, ui_status, _, review = _readiness(payload, row)
+    human_review_triggers = list(payload.get("human_review_triggers") or [])
+    if row.has_dependency_cycle and "DEPENDENCY_CYCLE" not in human_review_triggers:
+        human_review_triggers.append("DEPENDENCY_CYCLE")
+    if review and not human_review_triggers:
+        human_review_triggers.append("LEGACY_REVIEW_REQUIRED")
     return MappingDiscoveryDetailsResponse(
         etl_object_id=row.id,
         repository_id=row.repository_id,
@@ -975,6 +1096,12 @@ async def get_mapping_discovery_details(
         prerequisites=row.prerequisites or [],
         complexity=row.complexity,
         complexity_score=row.complexity_score,
+        complexity_version=(
+            getattr(row, "complexity_version", None)
+            or payload.get("complexity_version")
+            or complexity_details.get("version")
+        ),
+        complexity_details=complexity_details,
         complexity_reasons=payload.get("complexity_reasons", []),
         risks=payload.get("risks", []),
         unsupported_constructs=payload.get("unsupported_constructs", []),
@@ -984,6 +1111,7 @@ async def get_mapping_discovery_details(
         ),
         confidence=payload.get("confidence"),
         human_review_required=review,
+        human_review_triggers=human_review_triggers,
         gliner_decision=payload.get("gliner_decision"),
         gliner_confidence=payload.get("gliner_confidence"),
         readiness_status=ui_status,
@@ -2174,6 +2302,7 @@ async def get_mapping_conversion(
     row = await session.get(ETLObjectETL, etl_object_id)
     if row is None:
         return None
+    repository = await session.get(RepositoryETL, row.repository_id)
     rag = await _latest_agent_response(
         session,
         etl_object_id=etl_object_id,
@@ -2194,7 +2323,17 @@ async def get_mapping_conversion(
         "mapping_name": row.object_name,
         "migration_wave": row.migration_wave,
         "migration_status": row.migration_status,
-        "rag": _rag_api_response(rag),
+        "source": {
+            **_conversion_workbench_source_payload(row),
+            "content": (
+                bytes(repository.source_content).decode(
+                    "utf-8-sig", errors="replace"
+                )
+                if repository is not None and repository.source_content is not None
+                else None
+            ),
+        },
+        "rag": _rag_api_response(rag) if rag else None,
         "conversion": conversion.response_payload if conversion else None,
         "critique": critique.response_payload if critique else None,
     }
@@ -2220,6 +2359,25 @@ def _decode_artifact_content(content_row: ArtifactContentETL) -> str:
                 f"Binary artifact cannot be decoded using {encoding}."
             ) from exc
     raise ValueError("Artifact content row has no populated content value.")
+
+
+def _conversion_workbench_source_payload(mapping: ETLObjectETL) -> dict[str, Any]:
+    source_definition = mapping.source_definition or {}
+    source_metadata = source_definition.get("source_metadata") or {}
+    source_file_name = source_metadata.get("source_reference")
+    source_format = source_metadata.get("format")
+    if not source_format and source_file_name:
+        source_format = Path(source_file_name).suffix.lstrip(".").upper() or None
+
+    return {
+        "display_type": "CANONICAL_MAPPING",
+        "display_label": source_file_name or mapping.object_name,
+        "source_file_name": source_file_name,
+        "source_format": source_format,
+        "source_vendor": source_definition.get("source_vendor"),
+        "source_object_key": mapping.source_object_key,
+        "source_definition": source_definition,
+    }
 
 
 async def get_conversion_workbench(
@@ -2327,11 +2485,7 @@ async def get_conversion_workbench(
             "target_platform": workflow.scope_payload.get("target_platform"),
             "target_framework": workflow.scope_payload.get("target_framework"),
         },
-        "source": {
-            "display_type": "CANONICAL_MAPPING",
-            "source_object_key": mapping.source_object_key,
-            "source_definition": mapping.source_definition or {},
-        },
+        "source": _conversion_workbench_source_payload(mapping),
         "target": target_artifact,
         **workbench_metrics,
         "recommendations": list(dict.fromkeys(recommendations)),

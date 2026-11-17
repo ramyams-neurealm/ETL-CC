@@ -164,6 +164,7 @@ class RepositoryETL(Base):
     connection_type: Mapped[str] = mapped_column(String(30), nullable=False)
     environment: Mapped[str] = mapped_column(String(30), nullable=False)
     connection_config: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    source_content: Mapped[bytes | None] = mapped_column(LargeBinary)
     credential_ciphertext: Mapped[str | None] = mapped_column(Text, nullable=True)
     credential_algorithm: Mapped[str | None] = mapped_column(String(30), nullable=True)
     credential_key_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
@@ -208,6 +209,10 @@ class ETLObjectETL(Base):
     dependencies: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     complexity: Mapped[str | None] = mapped_column(String(20))
     complexity_score: Mapped[int | None] = mapped_column(Integer)
+    complexity_breakdown: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    complexity_version: Mapped[str | None] = mapped_column(String(50))
     transformation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     migration_wave: Mapped[int | None] = mapped_column(Integer)
     has_dependency_cycle: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -723,6 +728,8 @@ class MappingDiscoveryDetailsResponse(BaseModel):
     prerequisites: list[dict[str, Any]] = Field(default_factory=list)
     complexity: str | None
     complexity_score: int | None
+    complexity_version: str | None = None
+    complexity_details: dict[str, Any] = Field(default_factory=dict)
     complexity_reasons: list[str] = Field(default_factory=list)
     risks: list[dict[str, Any]] = Field(default_factory=list)
     unsupported_constructs: list[str] = Field(default_factory=list)
@@ -730,6 +737,7 @@ class MappingDiscoveryDetailsResponse(BaseModel):
     migration_recommendations: list[str] = Field(default_factory=list)
     confidence: float | None
     human_review_required: bool
+    human_review_triggers: list[str] = Field(default_factory=list)
     gliner_decision: str | None = None
     gliner_confidence: float | None = None
     readiness_status: str
