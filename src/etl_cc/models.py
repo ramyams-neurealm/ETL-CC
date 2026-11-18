@@ -824,7 +824,7 @@ class RAGAutomationMetrics(BaseModel):
     token_utilization_saved: int = 0
     token_reduction_percentage: float = 0.0
     actual_total_tokens: int = 0
-    token_savings_status: str = "NO_PROMPT_TOKEN_DATA"
+    token_savings_status: str = "NO_RAG_CONTRIBUTION"
     retrieved_context_tokens: int = 0
     prompt_compression_savings: int = 0
     rag_token_impact: int = 0

@@ -1548,13 +1548,14 @@ async def _latest_rag_retrieval_metrics(
         max(int(audit.accepted_count or 0), 0)
         for audit in latest_by_mapping.values()
     )
+    used_for_generation = any(
+        audit.accepted_count > 0 and audit.contributed_to_prompt is True
+        for audit in latest_by_mapping.values()
+    )
     return {
         "candidate_count": candidate_count,
         "accepted_count": accepted_count,
-        "used_for_generation": any(
-            audit.contributed_to_prompt is True
-            for audit in latest_by_mapping.values()
-        ),
+        "used_for_generation": used_for_generation,
         "retrieval_success_rate": _percentage(accepted_count, candidate_count),
         "retrieval_status": "COMPLETED" if candidate_count else "NO_CANDIDATES",
     }
@@ -1596,24 +1597,50 @@ def _rag_automation_metrics(
         and "baseline_prompt_tokens" in item["conversion_prompt_tokens"]
         and "actual_prompt_tokens" in item["conversion_prompt_tokens"]
     ]
+    aggregate_contribution = (
+        max(int(retrieval_metrics.get("accepted_count") or 0), 0) > 0
+        and retrieval_metrics.get("used_for_generation") is True
+    )
+    contributing_prompt_rows = [
+        item
+        for item in prompt_token_rows
+        if (
+            (
+                max(int(item.get("accepted_count") or 0), 0) > 0
+                and item.get("contributed_to_prompt") is True
+            )
+            if (
+                "accepted_count" in item
+                or "contributed_to_prompt" in item
+            )
+            else aggregate_contribution
+        )
+    ]
     baseline_total_tokens = sum(
         max(int(item.get("baseline_prompt_tokens") or 0), 0)
-        for item in prompt_token_rows
+        for item in contributing_prompt_rows
     )
     actual_total_tokens = sum(
         max(int(item.get("actual_prompt_tokens") or 0), 0)
-        for item in prompt_token_rows
+        for item in contributing_prompt_rows
     )
-    token_utilization_saved = baseline_total_tokens - actual_total_tokens
+    has_rag_contribution = bool(contributing_prompt_rows)
+    token_utilization_saved = (
+        baseline_total_tokens - actual_total_tokens
+        if has_rag_contribution else 0
+    )
     full_context_tokens = sum(
         max(int(item.get("full_context_tokens") or 0), 0)
-        for item in prompt_token_rows
+        for item in contributing_prompt_rows
     )
     retrieved_context_tokens = sum(
         max(int(item.get("retrieved_context_tokens") or 0), 0)
-        for item in prompt_token_rows
+        for item in contributing_prompt_rows
     )
-    rag_token_impact = actual_total_tokens - baseline_total_tokens
+    rag_token_impact = (
+        actual_total_tokens - baseline_total_tokens
+        if has_rag_contribution else 0
+    )
     rag_token_impact_status = (
         "INCREASED_PROMPT_SIZE"
         if rag_token_impact > 0
@@ -1640,16 +1667,18 @@ def _rag_automation_metrics(
                 token_utilization_saved / baseline_total_tokens * 100.0,
                 1,
             )
-            if baseline_total_tokens else 0.0
+            if has_rag_contribution and baseline_total_tokens else 0.0
         ),
         actual_total_tokens=actual_total_tokens,
         token_savings_status=(
-            "CALCULATED" if prompt_token_rows else "NO_PROMPT_TOKEN_DATA"
+            "CALCULATED"
+            if has_rag_contribution
+            else "NO_RAG_CONTRIBUTION"
         ),
         retrieved_context_tokens=retrieved_context_tokens,
         prompt_compression_savings=(
-            full_context_tokens - retrieved_context_tokens
-            if prompt_token_rows else 0
+            max(0, full_context_tokens - retrieved_context_tokens)
+            if has_rag_contribution else 0
         ),
         rag_token_impact=rag_token_impact,
         rag_token_impact_status=rag_token_impact_status,
@@ -1827,9 +1856,18 @@ async def get_migration_dashboard(
                 "retrieved_context_tokens": conversion_payload.get(
                     "retrieved_context_tokens"
                 ),
+                "accepted_count": max(
+                    int(rag_payload.get("accepted_count") or 0), 0
+                ),
+                "contributed_to_prompt": (
+                    rag_payload.get("contributed_to_prompt") is True
+                ),
                 "full_context_tokens": (
                     max(int(rag_payload.get("context_tokens") or 0), 0)
-                    if rag_payload.get("contributed_to_prompt") is True
+                    if (
+                        max(int(rag_payload.get("accepted_count") or 0), 0) > 0
+                        and rag_payload.get("contributed_to_prompt") is True
+                    )
                     else 0
                 ),
             }
