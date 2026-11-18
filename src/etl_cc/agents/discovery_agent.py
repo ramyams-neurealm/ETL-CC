@@ -15,6 +15,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from etl_cc.complexity import (
+    HIGH_RISK_TYPES,
+    MEDIUM_RISK_TYPES,
+    UNSUPPORTED_TYPES,
+    ComplexityAnalyzer,
+    ComplexityBreakdown,
+    derive_deterministic_risks,
+    unsupported_constructs,
+)
 from etl_cc.key_vault_service import DynamicChatOpenAI
 from etl_cc.config import settings
 from etl_cc.logging_config import configure_logging
@@ -109,6 +118,8 @@ class DiscoveryAnalysis(BaseModel):
     transformation_summary: TransformationSummary
     complexity: Literal["LOW", "MEDIUM", "HIGH", "VERY_HIGH"]
     complexity_score: int = Field(ge=0, le=100)
+    complexity_version: str = "complexity-v1"
+    complexity_details: ComplexityBreakdown = Field(default_factory=ComplexityBreakdown)
     complexity_reasons: list[str] = Field(default_factory=list)
     risks: list[DiscoveryRisk] = Field(default_factory=list)
     unsupported_constructs: list[str] = Field(default_factory=list)
@@ -116,6 +127,7 @@ class DiscoveryAnalysis(BaseModel):
     migration_recommendations: list[str] = Field(default_factory=list)
     confidence: float = Field(ge=0.0, le=1.0)
     human_review_required: bool
+    human_review_triggers: list[str] = Field(default_factory=list)
 
     gliner_decision: Literal[
         "AUTO_CONVERT",
@@ -143,29 +155,9 @@ class DiscoveryAgent:
         self.input_tokens = 0
         self.output_tokens = 0
 
-    _HIGH_RISK_TYPES = {
-        "java transformation",
-        "custom transformation",
-        "external procedure",
-        "stored procedure",
-        "sql transformation",
-        "update strategy",
-    }
-    _MEDIUM_RISK_TYPES = {
-        "lookup",
-        "lookup procedure",
-        "joiner",
-        "aggregator",
-        "sorter",
-        "rank",
-        "router",
-        "transaction control",
-    }
-    _UNSUPPORTED_TYPES = {
-        "java transformation",
-        "custom transformation",
-        "external procedure",
-    }
+    _HIGH_RISK_TYPES = HIGH_RISK_TYPES
+    _MEDIUM_RISK_TYPES = MEDIUM_RISK_TYPES
+    _UNSUPPORTED_TYPES = UNSUPPORTED_TYPES
 
     async def run(
         self,
@@ -191,11 +183,10 @@ class DiscoveryAgent:
         prerequisites = self._derive_prerequisites(mapping)
         deterministic_risks = self._derive_risks(mapping)
         unsupported = self._unsupported_constructs(mapping)
-        score, level, reasons = self._calculate_complexity(
-            mapping,
-            deterministic_risks,
-            unsupported,
-        )
+        complexity_details = ComplexityAnalyzer().analyze(mapping)
+        score = complexity_details.score
+        level = complexity_details.level
+        reasons = complexity_details.reasons
 
         semantic = await self._run_llm(
             mapping=mapping,
@@ -218,11 +209,14 @@ class DiscoveryAgent:
         ]
         rules = semantic_rules or deterministic_rules
         risks = self._merge_risks(deterministic_risks, semantic_risks)
-        human_review = (
-            semantic.human_review_required
-            or bool(unsupported)
-            or any(risk.severity in {"HIGH", "CRITICAL"} for risk in risks)
-        )
+        human_review_triggers: list[str] = []
+        if semantic.human_review_required:
+            human_review_triggers.append("SEMANTIC_REVIEW_REQUIRED")
+        if unsupported:
+            human_review_triggers.append("UNSUPPORTED_CONSTRUCTS")
+        if any(risk.severity in {"HIGH", "CRITICAL"} for risk in risks):
+            human_review_triggers.append("HIGH_OR_CRITICAL_RISK")
+        human_review = bool(human_review_triggers)
 
         high_risks = sum(1 for r in risks if r.severity in {"HIGH", "CRITICAL"})
         gliner_summary = (
@@ -243,6 +237,7 @@ class DiscoveryAgent:
             and gliner_res["decision"] != "AUTO_CONVERT"
         ):
             human_review = True
+            human_review_triggers.append("GLINER_REQUIRES_REVIEW")
         logger.info(
             "GLINER_ADVICE decision=%s confidence=%.2f",
             gliner_res["decision"],
@@ -256,6 +251,8 @@ class DiscoveryAgent:
             transformation_summary=summary,
             complexity=level,
             complexity_score=score,
+            complexity_version=complexity_details.version,
+            complexity_details=complexity_details,
             complexity_reasons=reasons,
             risks=risks,
             unsupported_constructs=unsupported,
@@ -263,6 +260,7 @@ class DiscoveryAgent:
             migration_recommendations=semantic.migration_recommendations,
             confidence=semantic.confidence,
             human_review_required=human_review,
+            human_review_triggers=human_review_triggers,
             gliner_decision=gliner_res["decision"],
             gliner_confidence=gliner_res["confidence"],
         )
@@ -548,71 +546,13 @@ Return only the requested structured output."""
         return prerequisites
 
     def _derive_risks(self, mapping: CanonicalMapping) -> list[DiscoveryRisk]:
-        risks: list[DiscoveryRisk] = []
-        for transformation in mapping.transformations:
-            normalized = transformation.transformation_type.lower()
-            if normalized in self._HIGH_RISK_TYPES:
-                risks.append(
-                    DiscoveryRisk(
-                        risk_type="COMPLEX_TRANSFORMATION",
-                        severity="HIGH",
-                        source_object=transformation.name,
-                        description=(
-                            f"{transformation.transformation_type} requires detailed "
-                            "behavioral review during PySpark conversion."
-                        ),
-                        recommendation=(
-                            "Review transformation properties, expressions, error handling, "
-                            "state behavior, and target-side effects before conversion."
-                        ),
-                    )
-                )
-            elif normalized in self._MEDIUM_RISK_TYPES:
-                risks.append(
-                    DiscoveryRisk(
-                        risk_type="SEMANTIC_PARITY",
-                        severity="MEDIUM",
-                        source_object=transformation.name,
-                        description=(
-                            f"{transformation.transformation_type} behavior must be "
-                            "preserved in the generated implementation."
-                        ),
-                        recommendation=(
-                            "Validate null handling, duplicate behavior, ordering, cache or "
-                            "join semantics, and rejected records."
-                        ),
-                    )
-                )
-
-            properties: dict[str, Any] = transformation.properties or {}
-            for key, value in properties.items():
-                key_text = str(key).lower()
-                value_text = str(value).strip()
-                if value_text and any(
-                    marker in key_text
-                    for marker in ("sql query", "sql override", "pre sql", "post sql")
-                ):
-                    risks.append(
-                        DiscoveryRisk(
-                            risk_type="CUSTOM_SQL",
-                            severity="HIGH",
-                            source_object=transformation.name,
-                            description=f"Custom SQL is configured in property {key}.",
-                            recommendation=(
-                                "Review SQL dialect, pushdown behavior, side effects, and "
-                                "target-platform compatibility."
-                            ),
-                        )
-                    )
-        return risks
+        return [
+            DiscoveryRisk(**risk)
+            for risk in derive_deterministic_risks(mapping)
+        ]
 
     def _unsupported_constructs(self, mapping: CanonicalMapping) -> list[str]:
-        constructs = {
-            transformation.transformation_type
-            for transformation in mapping.transformations
-            if transformation.transformation_type.lower() in self._UNSUPPORTED_TYPES
-        }
-        return sorted(constructs)
+        return unsupported_constructs(mapping)
 
     def _calculate_complexity(
         self,
@@ -620,41 +560,11 @@ Return only the requested structured output."""
         risks: list[DiscoveryRisk],
         unsupported: list[str],
     ) -> tuple[int, Literal["LOW", "MEDIUM", "HIGH", "VERY_HIGH"], list[str]]:
-        score = 10
-        reasons: list[str] = []
-
-        transformation_count = len(mapping.transformations)
-        score += min(transformation_count * 2, 24)
-        if transformation_count:
-            reasons.append(f"Contains {transformation_count} transformations.")
-
-        additional_datasets = max(len(mapping.sources) + len(mapping.targets) - 2, 0)
-        score += min(additional_datasets * 3, 12)
-        if additional_datasets:
-            reasons.append("Uses multiple source or target datasets.")
-
-        medium_count = sum(risk.severity == "MEDIUM" for risk in risks)
-        high_count = sum(risk.severity in {"HIGH", "CRITICAL"} for risk in risks)
-        score += min(medium_count * 5, 20)
-        score += min(high_count * 10, 30)
-        if medium_count:
-            reasons.append(f"Contains {medium_count} medium-risk constructs.")
-        if high_count:
-            reasons.append(f"Contains {high_count} high-risk constructs.")
-
-        score += min(len(mapping.parameters) * 2, 8)
-        score += min(len(mapping.dependencies) * 4, 12)
-        score += min(len(unsupported) * 15, 30)
-        score = min(score, 100)
-
-        if score <= 30:
-            level: Literal["LOW", "MEDIUM", "HIGH", "VERY_HIGH"] = "LOW"
-        elif score <= 55:
-            level = "MEDIUM"
-        elif score <= 80:
-            level = "HIGH"
-        else:
-            level = "VERY_HIGH"
+        score, level, reasons, _ = ComplexityAnalyzer.calculate_score(
+            mapping,
+            [risk.model_dump() for risk in risks],
+            unsupported,
+        )
         return score, level, reasons
 
     @staticmethod

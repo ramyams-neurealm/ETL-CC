@@ -806,6 +806,10 @@ async def _process(workflow_id: int) -> None:
             row.prerequisites = [item.model_dump(mode="json") for item in discovery.prerequisites]
             row.complexity = discovery.complexity
             row.complexity_score = discovery.complexity_score
+            row.complexity_version = discovery.complexity_version
+            row.complexity_breakdown = discovery.complexity_details.model_dump(
+                mode="json"
+            )
             definition = dict(row.source_definition or {})
             definition["discovery_analysis"] = discovery.model_dump(mode="json")
             row.source_definition = definition
