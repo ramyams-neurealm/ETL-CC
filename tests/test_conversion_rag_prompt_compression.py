@@ -144,6 +144,46 @@ def test_compaction_discards_lowest_ranked_items_until_under_hard_cap():
     assert len(compact_rag["retrieved_items"]) < 100
 
 
+def test_empty_retrieval_has_zero_content_tokens_and_excludes_json_overhead():
+    agent = ConversionAgent("AB_INITIO")
+    empty_rag = RAGRetrievalResult(
+        mapping_name="current_mapping",
+        status="NO_MATCH",
+        embedding_model="text-embedding-3-small",
+        retrieved_items=[],
+        candidate_count=0,
+        eligible_knowledge_count=0,
+        retrieval_count=0,
+        accepted_count=0,
+        confidence=0.0,
+        average_similarity=0.0,
+        contributed_to_prompt=False,
+        context_tokens=0,
+    )
+
+    compact_rag, empty_context_tokens, _ = agent._compact_rag_for_prompt(
+        empty_rag
+    )
+    content_items = [
+        {
+            "title": "Orders",
+            "summary": {
+                "mapping_name": "orders",
+                "confidence_score": 0.95,
+                "business_rule_summaries": ["Copy active rows."],
+            },
+            "knowledge_id": 42,
+            "relevance_score": 0.99,
+        }
+    ]
+
+    assert compact_rag["retrieved_items"] == []
+    assert empty_context_tokens == 0
+    assert agent._retrieved_content_tokens(content_items) == agent._token_count(
+        "Orders orders Copy active rows."
+    )
+
+
 def test_prompt_token_measurements_are_persistable_in_conversion_audit_payload():
     system_prompt = "Convert the canonical mapping."
     baseline_evidence = '{"canonical_mapping":{"mapping_name":"orders"}}'

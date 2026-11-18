@@ -262,6 +262,28 @@ class ConversionAgent:
             "generated_code_summary": cls._bounded_text(code_summary, 400),
         }
 
+    @classmethod
+    def _retrieved_content_tokens(cls, items: list[dict[str, Any]]) -> int:
+        """Count injected content strings, excluding JSON and metadata overhead."""
+        content_values: list[str] = []
+
+        def collect_strings(value: Any) -> None:
+            if isinstance(value, str) and value:
+                content_values.append(value)
+            elif isinstance(value, list):
+                for entry in value:
+                    collect_strings(entry)
+            elif isinstance(value, dict):
+                for entry in value.values():
+                    collect_strings(entry)
+
+        for item in items:
+            collect_strings(item.get("title"))
+            collect_strings(item.get("summary"))
+        if not content_values:
+            return 0
+        return cls._token_count(" ".join(content_values))
+
     def _compact_rag_for_prompt(
         self,
         rag: RAGRetrievalResult,
@@ -323,12 +345,17 @@ class ConversionAgent:
                 )
             )
 
+        def retrieved_content_tokens() -> int:
+            return self._retrieved_content_tokens(
+                rag_payload["retrieved_items"]
+            )
+
         while (
             rag_payload["retrieved_items"]
             and compact_context_tokens() > self.max_retrieval_context_tokens
         ):
             rag_payload["retrieved_items"].pop()
-        return rag_payload, compact_context_tokens(), excluded_counts
+        return rag_payload, retrieved_content_tokens(), excluded_counts
 
     async def run(
         self,
@@ -564,7 +591,11 @@ Return only the requested structured output.
 
         parsed.baseline_prompt_tokens = prompt_tokens_before_rag
         parsed.actual_prompt_tokens = prompt_tokens_after_rag
-        parsed.retrieved_context_tokens = retrieved_context_tokens
+        parsed.retrieved_context_tokens = (
+            retrieved_context_tokens
+            if rag.accepted_count > 0 and rag.contributed_to_prompt
+            else 0
+        )
         await self._replace_unit_test_with_rendered_specification(
             parsed,
             mapping,

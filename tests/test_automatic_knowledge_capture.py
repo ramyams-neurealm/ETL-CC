@@ -450,7 +450,7 @@ def test_rag_automation_metrics_return_zero_with_statuses_when_data_missing():
     assert metrics.actual_total_tokens == 0
     assert metrics.token_utilization_saved == 0
     assert metrics.token_reduction_percentage == 0
-    assert metrics.token_savings_status == "NO_PROMPT_TOKEN_DATA"
+    assert metrics.token_savings_status == "NO_RAG_CONTRIBUTION"
     assert metrics.retrieved_context_tokens == 0
     assert metrics.prompt_compression_savings == 0
     assert metrics.rag_token_impact == 0
@@ -466,12 +466,12 @@ def test_rag_token_impact_reports_increased_and_reduced_prompt_size():
         "knowledge_reuse_rate": 0.0,
         "rag_contribution_rate": 0.0,
     }
-    no_retrieval = {
-        "candidate_count": 0,
-        "accepted_count": 0,
-        "used_for_generation": False,
+    contributing_retrieval = {
+        "candidate_count": 1,
+        "accepted_count": 1,
+        "used_for_generation": True,
         "retrieval_success_rate": 0.0,
-        "retrieval_status": "NO_RETRIEVAL_DATA",
+        "retrieval_status": "COMPLETED",
     }
 
     increased = _rag_automation_metrics(
@@ -482,12 +482,14 @@ def test_rag_token_impact_reports_increased_and_reduced_prompt_size():
                     "actual_prompt_tokens": 52_000,
                     "retrieved_context_tokens": 8_000,
                     "full_context_tokens": 12_000,
+                    "accepted_count": 1,
+                    "contributed_to_prompt": True,
                 }
             }
         ],
         {},
         empty_knowledge,
-        no_retrieval,
+        contributing_retrieval,
     )
     reduced = _rag_automation_metrics(
         [
@@ -497,12 +499,14 @@ def test_rag_token_impact_reports_increased_and_reduced_prompt_size():
                     "actual_prompt_tokens": 32_000,
                     "retrieved_context_tokens": 4_000,
                     "full_context_tokens": 10_000,
+                    "accepted_count": 1,
+                    "contributed_to_prompt": True,
                 }
             }
         ],
         {},
         empty_knowledge,
-        no_retrieval,
+        contributing_retrieval,
     )
     unchanged = _rag_automation_metrics(
         [
@@ -512,12 +516,14 @@ def test_rag_token_impact_reports_increased_and_reduced_prompt_size():
                     "actual_prompt_tokens": 45_000,
                     "retrieved_context_tokens": 4_000,
                     "full_context_tokens": 10_000,
+                    "accepted_count": 1,
+                    "contributed_to_prompt": True,
                 }
             }
         ],
         {},
         empty_knowledge,
-        no_retrieval,
+        contributing_retrieval,
     )
 
     assert increased.rag_token_impact == 7_000
@@ -528,6 +534,79 @@ def test_rag_token_impact_reports_increased_and_reduced_prompt_size():
     assert reduced.prompt_compression_savings == 6_000
     assert unchanged.rag_token_impact == 0
     assert unchanged.rag_token_impact_status == "NO_CHANGE"
+
+    clamped_compression = _rag_automation_metrics(
+        [
+            {
+                "conversion_prompt_tokens": {
+                    "baseline_prompt_tokens": 45_000,
+                    "actual_prompt_tokens": 45_000,
+                    "retrieved_context_tokens": 4_000,
+                    "full_context_tokens": 2_000,
+                    "accepted_count": 1,
+                    "contributed_to_prompt": True,
+                }
+            }
+        ],
+        {},
+        empty_knowledge,
+        contributing_retrieval,
+    )
+    assert clamped_compression.prompt_compression_savings == 0
+
+
+def test_token_savings_are_zero_without_accepted_rag_contribution():
+    no_knowledge = {
+        "total_successful_patterns": 0,
+        "knowledge_reuse_rate": 0.0,
+        "rag_contribution_rate": 0.0,
+    }
+
+    for retrieval_metrics in (
+        {
+            "candidate_count": 0,
+            "accepted_count": 0,
+            "used_for_generation": False,
+            "retrieval_status": "NO_CANDIDATES",
+        },
+        {
+            "candidate_count": 1,
+            "accepted_count": 0,
+            "used_for_generation": False,
+            "retrieval_status": "COMPLETED",
+        },
+        {
+            "candidate_count": 1,
+            "accepted_count": 1,
+            "used_for_generation": False,
+            "retrieval_status": "COMPLETED",
+        },
+    ):
+        metrics = _rag_automation_metrics(
+            [
+                {
+                    "conversion_prompt_tokens": {
+                        "baseline_prompt_tokens": 45_000,
+                        "actual_prompt_tokens": 52_000,
+                        "retrieved_context_tokens": 8_000,
+                        "full_context_tokens": 132_879,
+                    }
+                }
+            ],
+            {},
+            no_knowledge,
+            retrieval_metrics,
+        )
+
+        assert metrics.baseline_total_tokens == 0
+        assert metrics.actual_total_tokens == 0
+        assert metrics.retrieved_context_tokens == 0
+        assert metrics.prompt_compression_savings == 0
+        assert metrics.rag_token_impact == 0
+        assert metrics.rag_token_impact_status == "NO_CHANGE"
+        assert metrics.token_utilization_saved == 0
+        assert metrics.token_reduction_percentage == 0
+        assert metrics.token_savings_status == "NO_RAG_CONTRIBUTION"
 
 
 class _RetrievalAuditSession:
