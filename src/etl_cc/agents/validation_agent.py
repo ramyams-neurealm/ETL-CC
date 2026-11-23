@@ -1281,6 +1281,8 @@ class ValidationContext(BaseModel):
     minimum_functional_parity: float = Field(default=0.50, ge=0, le=1)
     input_mode: Literal["SIMULATE", "DATASET_FILE", "DATABASE_TABLES"] = "SIMULATE"
     input_datasets: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    dataset_assignments: list[dict[str, Any]] | None = None
+    input_dataset_schemas: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     expected_output_rows: list[dict[str, Any]] | None = None
     requested_row_count: int = 1000
     numeric_tolerance: Decimal = Field(default=Decimal("0"), ge=0)
@@ -1318,6 +1320,8 @@ class ValidationResult(BaseModel):
     status: Literal["PASSED", "FAILED"]
     deployable: bool
     minimum_functional_parity: float
+    schema_validation: Literal["PASSED", "FAILED", "SKIPPED"] = "SKIPPED"
+    target_execution: Literal["PASSED", "FAILED", "SKIPPED"] = "SKIPPED"
     match_percentage: float | None = None
     rows_compared: int = 0
     confidence_index: float = 0.0
@@ -2073,6 +2077,378 @@ def sanitized_spark_environment():
                 os.environ[key] = value
 
 
+class SchemaValidationResult(BaseModel):
+    status: Literal["PASSED", "FAILED"]
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SchemaContractValidator:
+    AGENT_NAME = "SCHEMA_CONTRACT_VALIDATOR"
+    AGENT_VERSION = "1.0.0"
+    STAGE_NAME = "SCHEMA_VALIDATION"
+    MODEL_NAME = "DETERMINISTIC_SOURCE_CONTRACT"
+
+    _TYPE_ALIASES = {
+        "char": "string",
+        "character": "string",
+        "varchar": "string",
+        "varchar2": "string",
+        "text": "string",
+        "int": "integer",
+        "int32": "integer",
+        "smallint": "integer",
+        "bigint": "integer",
+        "long": "integer",
+        "int64": "integer",
+        "numeric": "decimal",
+        "number": "decimal",
+        "float": "floating",
+        "double": "floating",
+        "real": "floating",
+        "bool": "boolean",
+        "datetime": "timestamp",
+    }
+
+    @classmethod
+    def _type_category(cls, data_type: str | None) -> str:
+        normalized = str(data_type or "").strip().lower()
+        if normalized.startswith(("decimal", "numeric", "number")):
+            return "decimal"
+        if normalized.startswith(("varchar", "char", "string", "text")):
+            return "string"
+        if normalized in cls._TYPE_ALIASES:
+            return cls._TYPE_ALIASES[normalized]
+        if normalized in {
+            "date",
+            "timestamp",
+            "boolean",
+            "integer",
+            "floating",
+            "unknown",
+            "mixed",
+        }:
+            return normalized
+        return "unsupported"
+
+    @staticmethod
+    def _value_matches(value: Any, expected_type: str) -> bool:
+        if value is None:
+            return True
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type in {"decimal", "floating"}:
+            return isinstance(value, (int, float, Decimal)) and not isinstance(
+                value, bool
+            )
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "date":
+            if isinstance(value, datetime):
+                return False
+            if isinstance(value, date):
+                return True
+            if isinstance(value, str):
+                try:
+                    date.fromisoformat(value)
+                    return True
+                except ValueError:
+                    return False
+            return False
+        if expected_type == "timestamp":
+            if isinstance(value, datetime):
+                return True
+            if isinstance(value, str):
+                try:
+                    datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    return True
+                except ValueError:
+                    return False
+            return False
+        return False
+
+    @classmethod
+    def _compatible(cls, expected_type: str, actual_type: str) -> bool:
+        if expected_type == actual_type:
+            return True
+        if expected_type in {"decimal", "floating"}:
+            return actual_type in {"integer", "decimal", "floating"}
+        if expected_type in {"date", "timestamp"}:
+            return actual_type == "string" or actual_type == "date" and expected_type == "timestamp"
+        return False
+
+    @classmethod
+    def run(
+        cls,
+        mapping: CanonicalMapping,
+        input_datasets: dict[str, list[dict[str, Any]]],
+        dataset_assignments: list[dict[str, Any]] | None = None,
+        input_dataset_schemas: dict[str, list[dict[str, Any]]] | None = None,
+        input_mode: str = "SIMULATE",
+    ) -> SchemaValidationResult:
+        errors: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        source_by_name = {source.name: source for source in mapping.sources}
+
+        def add_issue(
+            target: list[dict[str, Any]],
+            code: str,
+            message: str,
+            column: str | None = None,
+            dataset_name: str | None = None,
+            **details: Any,
+        ) -> None:
+            issue: dict[str, Any] = {
+                "code": code,
+                "message": message,
+            }
+            if column is not None:
+                issue["column"] = column
+            if dataset_name is not None:
+                issue["dataset_name"] = dataset_name
+            issue.update(details)
+            target.append(issue)
+
+        assignments = dataset_assignments
+        if assignments is None:
+            assignments = [
+                {"dataset_name": name}
+                for name in input_datasets
+            ]
+        if not source_by_name:
+            add_issue(
+                errors,
+                "MISSING_SOURCE_SCHEMA",
+                "The mapping does not define a source schema.",
+            )
+        if input_mode != "SIMULATE" and not assignments:
+            add_issue(
+                errors,
+                "MISSING_SOURCE_ASSIGNMENT",
+                "No uploaded or database source datasets were assigned.",
+            )
+
+        assignment_counts: dict[str, int] = defaultdict(int)
+        upload_counts: dict[str, int] = defaultdict(int)
+        assigned_by_name: dict[str, dict[str, Any]] = {}
+        for assignment in assignments:
+            dataset_name = str(assignment.get("dataset_name") or "")
+            upload_id = str(assignment.get("upload_id") or "")
+            if upload_id:
+                upload_counts[upload_id] += 1
+                if upload_counts[upload_id] > 1:
+                    add_issue(
+                        errors,
+                        "DUPLICATE_UPLOAD_ASSIGNMENT",
+                        f"Upload '{upload_id}' is assigned more than once.",
+                        dataset_name=dataset_name,
+                        upload_id=upload_id,
+                    )
+            if dataset_name not in source_by_name:
+                add_issue(
+                    errors,
+                    "UNKNOWN_DATASET",
+                    f"Dataset '{dataset_name}' is not defined as a mapping source.",
+                    dataset_name=dataset_name,
+                    upload_id=upload_id or None,
+                )
+                continue
+            assignment_counts[dataset_name] += 1
+            assigned_by_name.setdefault(dataset_name, assignment)
+            if assignment_counts[dataset_name] > 1:
+                add_issue(
+                    errors,
+                    "DUPLICATE_SOURCE_ASSIGNMENT",
+                    f"Source dataset '{dataset_name}' is assigned more than once.",
+                    dataset_name=dataset_name,
+                )
+            load_error = assignment.get("load_error")
+            if load_error:
+                add_issue(
+                    errors,
+                    str(assignment.get("load_error_code") or "UPLOAD_INVALID"),
+                    str(load_error),
+                    dataset_name=dataset_name,
+                    upload_id=upload_id or None,
+                )
+
+        if input_mode != "SIMULATE":
+            for source_name in source_by_name:
+                if not assignment_counts.get(source_name):
+                    add_issue(
+                        errors,
+                        "MISSING_SOURCE_ASSIGNMENT",
+                        f"Required source dataset '{source_name}' is not assigned.",
+                        dataset_name=source_name,
+                    )
+
+        schema_by_dataset = input_dataset_schemas or {}
+        for dataset_name, assignment in assigned_by_name.items():
+            if assignment.get("load_error"):
+                continue
+            source = source_by_name[dataset_name]
+            schema = assignment.get("schema") or schema_by_dataset.get(dataset_name)
+            if schema is None:
+                values = input_datasets.get(dataset_name, [])
+                columns = list(dict.fromkeys(
+                    str(column) for row in values for column in row
+                ))
+                inferred_schema = []
+                for column in columns:
+                    column_values = [
+                        row.get(column)
+                        for row in values
+                        if row.get(column) is not None
+                    ]
+                    inferred_schema.append(
+                        {
+                            "name": column,
+                            "data_type": cls._infer_value_type(column_values),
+                        }
+                    )
+                schema = inferred_schema
+
+            actual_columns = [str(field.get("name") or "") for field in schema]
+            folded_columns: dict[str, str] = {}
+            for column in actual_columns:
+                folded = column.casefold()
+                if folded in folded_columns:
+                    add_issue(
+                        errors,
+                        "DUPLICATE_COLUMN",
+                        f"Uploaded dataset contains duplicate column '{column}'.",
+                        column=column,
+                        dataset_name=dataset_name,
+                    )
+                else:
+                    folded_columns[folded] = column
+
+            expected_fields: dict[str, Any] = {}
+            for field in source.fields:
+                if field.name in expected_fields:
+                    add_issue(
+                        errors,
+                        "DUPLICATE_EXPECTED_COLUMN",
+                        f"Mapping source schema contains duplicate column '{field.name}'.",
+                        column=field.name,
+                        dataset_name=dataset_name,
+                    )
+                expected_fields[field.name] = field
+
+            actual_set = set(actual_columns)
+            expected_set = set(expected_fields)
+            for column in sorted(expected_set - actual_set):
+                add_issue(
+                    errors,
+                    "MISSING_COLUMN",
+                    f"Required column '{column}' is missing.",
+                    column=column,
+                    dataset_name=dataset_name,
+                )
+            for column in sorted(actual_set - expected_set):
+                add_issue(
+                    warnings,
+                    "UNEXPECTED_COLUMN",
+                    f"Uploaded column '{column}' is not defined in the mapping source schema.",
+                    column=column,
+                    dataset_name=dataset_name,
+                )
+
+            actual_types = {
+                str(field.get("name") or ""): str(field.get("data_type") or "unknown")
+                for field in schema
+            }
+            rows = input_datasets.get(dataset_name, [])
+            for column in sorted(expected_set & actual_set):
+                expected_field = expected_fields[column]
+                expected_type = cls._type_category(expected_field.data_type)
+                actual_type = cls._type_category(actual_types.get(column))
+                if expected_type == "unsupported":
+                    add_issue(
+                        errors,
+                        "UNSUPPORTED_EXPECTED_TYPE",
+                        f"Mapping datatype '{expected_field.data_type}' for '{column}' is unsupported.",
+                        column=column,
+                        dataset_name=dataset_name,
+                        expected_type=expected_field.data_type,
+                    )
+                    continue
+                if actual_type == "unknown":
+                    add_issue(
+                        errors,
+                        "UNKNOWN_DATATYPE",
+                        f"Column '{column}' has no inferable uploaded datatype; expected '{expected_field.data_type}'.",
+                        column=column,
+                        dataset_name=dataset_name,
+                        expected_type=expected_field.data_type,
+                        actual_type=actual_types.get(column),
+                    )
+                    continue
+                values = [
+                    row[column]
+                    for row in rows
+                    if column in row and row[column] is not None
+                ]
+                if not cls._compatible(expected_type, actual_type):
+                    add_issue(
+                        errors,
+                        "INCOMPATIBLE_DATATYPE",
+                        f"Column '{column}' has uploaded datatype '{actual_types.get(column)}'; expected '{expected_field.data_type}'.",
+                        column=column,
+                        dataset_name=dataset_name,
+                        expected_type=expected_field.data_type,
+                        actual_type=actual_types.get(column),
+                    )
+                    continue
+                if actual_type == "mixed" or any(
+                    not cls._value_matches(value, expected_type)
+                    for value in values
+                ):
+                    code = (
+                        "INVALID_DATE_VALUE"
+                        if expected_type in {"date", "timestamp"}
+                        else "INCOMPATIBLE_DATATYPE"
+                    )
+                    add_issue(
+                        errors,
+                        code,
+                        f"Column '{column}' contains values incompatible with datatype '{expected_field.data_type}'.",
+                        column=column,
+                        dataset_name=dataset_name,
+                        expected_type=expected_field.data_type,
+                        actual_type=actual_types.get(column),
+                    )
+
+        return SchemaValidationResult(
+            status="FAILED" if errors else "PASSED",
+            errors=errors,
+            warnings=warnings,
+        )
+
+    @staticmethod
+    def _infer_value_type(values: list[Any]) -> str:
+        if not values:
+            return "unknown"
+        if all(isinstance(value, str) for value in values):
+            return "string"
+        if all(isinstance(value, bool) for value in values):
+            return "boolean"
+        if all(isinstance(value, int) and not isinstance(value, bool) for value in values):
+            return "integer"
+        if all(
+            isinstance(value, (int, float, Decimal)) and not isinstance(value, bool)
+            for value in values
+        ):
+            return "decimal"
+        if all(isinstance(value, datetime) for value in values):
+            return "timestamp"
+        if all(isinstance(value, date) for value in values):
+            return "date"
+        return "mixed"
+
+
 class TargetExecutionResult(BaseModel):
     status: Literal["PASSED", "FAILED", "SKIPPED"]
     rows: list[dict[str, Any]] = Field(default_factory=list)
@@ -2080,6 +2456,7 @@ class TargetExecutionResult(BaseModel):
     row_count: int = 0
     stdout: str = ""
     stderr: str = ""
+    error_type: str | None = None
     error_message: str | None = None
 
 
@@ -2243,7 +2620,13 @@ finally:
                     check=False,
                 )
                 if completed.returncode != 0:
-                    return TargetExecutionResult(status="FAILED", stdout=completed.stdout[-10000:], stderr=completed.stderr[-10000:], error_message=(completed.stderr or completed.stdout)[-4000:])
+                    return TargetExecutionResult(
+                        status="FAILED",
+                        stdout=completed.stdout[-10000:],
+                        stderr=completed.stderr[-10000:],
+                        error_type="TRANSFORM_EXCEPTION",
+                        error_message=(completed.stderr or completed.stdout)[-4000:],
+                    )
                 target_rows = json.loads(output_path.read_text(encoding="utf-8"))
                 rows = (
                     next(iter(target_rows.values()))
@@ -2258,10 +2641,26 @@ finally:
                     stdout=completed.stdout[-10000:],
                     stderr=completed.stderr[-10000:],
                 )
-        except subprocess.TimeoutExpired:
-            return TargetExecutionResult(status="FAILED", error_message=f"Target execution exceeded {timeout} seconds.")
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode("utf-8", errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            return TargetExecutionResult(
+                status="FAILED",
+                stdout=str(stdout)[-10000:],
+                stderr=str(stderr)[-10000:],
+                error_type="EXECUTION_TIMEOUT",
+                error_message=f"Target execution exceeded {timeout} seconds.",
+            )
         except Exception as exc:
-            return TargetExecutionResult(status="FAILED", error_message=str(exc)[:4000])
+            return TargetExecutionResult(
+                status="FAILED",
+                error_type="EXECUTOR_EXCEPTION",
+                error_message=str(exc)[:4000],
+            )
 
 
 class StaticCoverageResult(BaseModel):
@@ -3102,6 +3501,107 @@ class ValidationAgent:
         # data directory is created.
         files: dict[str, str] = {}
 
+        schema_agent = SchemaContractValidator()
+        schema_validation = schema_agent.run(
+            mapping,
+            context.input_datasets,
+            context.dataset_assignments,
+            context.input_dataset_schemas,
+            context.input_mode,
+        )
+        schema_payload = schema_validation.model_dump(mode="json")
+        schema_payload.update(
+            {
+                "stage": "SCHEMA_VALIDATION",
+                "status": schema_validation.status,
+            }
+        )
+        stages.append(
+            self._stage(
+                schema_agent,
+                "COMPLETED"
+                if schema_validation.status == "PASSED"
+                else "FAILED",
+                schema_payload,
+                None
+                if schema_validation.status == "PASSED"
+                else "Uploaded source schema does not satisfy the mapping contract.",
+            )
+        )
+        stage_completed(
+            logger,
+            "SCHEMA_VALIDATION",
+            mapping=mapping.mapping_name,
+            status=schema_validation.status,
+            errors=len(schema_validation.errors),
+            warnings=len(schema_validation.warnings),
+        )
+        if schema_validation.status == "FAILED":
+            target = TargetExecutionResult(
+                status="SKIPPED",
+                error_type="SCHEMA_VALIDATION_FAILED",
+                error_message="Target execution was skipped because schema validation failed.",
+            )
+            target_agent = TargetPySparkExecutor()
+            target_payload = target.model_dump(mode="json")
+            target_payload.update(
+                {
+                    "stage": "TARGET_EXECUTION",
+                    "status": "SKIPPED",
+                    "message": target.error_message,
+                }
+            )
+            stages.append(
+                self._stage(
+                    target_agent,
+                    "SKIPPED",
+                    target_payload,
+                    target.error_message,
+                )
+            )
+            failure_reason = "; ".join(
+                issue["message"] for issue in schema_validation.errors
+            )
+            tests.extend(
+                [
+                    ValidationTestResult(
+                        test_id="SCHEMA-001",
+                        test_name="Uploaded source schema contract",
+                        category="SCHEMA_VALIDATION",
+                        status="FAILED",
+                        severity="CRITICAL",
+                        expected_result="Uploaded datasets satisfy the mapping source schema.",
+                        actual_result="FAILED",
+                        details=failure_reason,
+                        evidence_payload=schema_payload,
+                    ),
+                    ValidationTestResult(
+                        test_id="DATA-003",
+                        test_name="Target execution",
+                        category="DATA_PARITY",
+                        status="SKIPPED",
+                        severity="CRITICAL",
+                        expected_result="Target execution runs only after schema validation passes.",
+                        actual_result="SKIPPED",
+                        details=target.error_message,
+                        evidence_payload=target_payload,
+                    ),
+                ]
+            )
+            return ValidationResult(
+                mapping_name=mapping.mapping_name,
+                status="FAILED",
+                deployable=False,
+                minimum_functional_parity=context.minimum_functional_parity,
+                schema_validation="FAILED",
+                target_execution="SKIPPED",
+                failure_reason=failure_reason,
+                recommendation="Correct the uploaded dataset assignments or source schema and retry validation.",
+                test_cases=tests,
+                stages=stages,
+                data_files=files,
+            )
+
         plan_agent = TestPlanAgent()
         plan = plan_agent.run(mapping, context.discovery)
         stages.append(self._stage(plan_agent, "COMPLETED", plan.model_dump(mode="json")))
@@ -3283,14 +3783,23 @@ class ValidationAgent:
             if synthetic_validation.status == "PASSED" and static.safe_to_execute_tests
             else TargetExecutionResult(
                 status="SKIPPED",
+                error_type="EXECUTION_SKIPPED",
                 error_message="Synthetic or static validation blocked target execution.",
             )
+        )
+        target_payload = target.model_dump(mode="json")
+        target_payload.update(
+            {
+                "stage": "TARGET_EXECUTION",
+                "status": target.status,
+                "message": target.error_message,
+            }
         )
         stages.append(
             self._stage(
                 target_agent,
                 "COMPLETED" if target.status == "PASSED" else target.status,
-                target.model_dump(mode="json"),
+                target_payload,
                 target.error_message,
             )
         )
@@ -3459,6 +3968,8 @@ class ValidationAgent:
             status="PASSED" if passed else "FAILED",
             deployable=passed,
             minimum_functional_parity=context.minimum_functional_parity,
+            schema_validation="PASSED",
+            target_execution=target.status,
             match_percentage=match.match_percentage if match else None,
             rows_compared=match.rows_compared if match else 0,
             confidence_index=confidence,
@@ -3558,7 +4069,26 @@ class ValidationAgent:
             "confidence_index": confidence,
             "matchflow": match.model_dump(mode="json") if match else None,
         }
-        return [ValidationTestResult(test_id=test_id, test_name=name, category="DATA_PARITY", status="PASSED" if passed else "FAILED", severity="CRITICAL" if test_id in {"DATA-003","DATA-008","DATA-009"} else "HIGH", expected_result=details, actual_result=actual, details=details, evidence_payload=evidence) for test_id,name,passed,actual,details in rows]
+        return [
+            ValidationTestResult(
+                test_id=test_id,
+                test_name=name,
+                category="DATA_PARITY",
+                status=(
+                    "PASSED"
+                    if passed
+                    else "SKIPPED"
+                    if test_id == "DATA-003" and target.status == "SKIPPED"
+                    else "FAILED"
+                ),
+                severity="CRITICAL" if test_id in {"DATA-003","DATA-008","DATA-009"} else "HIGH",
+                expected_result=details,
+                actual_result=actual,
+                details=details,
+                evidence_payload=evidence,
+            )
+            for test_id, name, passed, actual, details in rows
+        ]
 
     @staticmethod
     def _failure(static: StaticValidationResult, unit: Any, synthetic: SyntheticDataValidationResult, legacy: Any, target: TargetExecutionResult, match: MatchFlowResult | None, confidence: float, confidence_threshold: float, minimum: float) -> tuple[str, str]:

@@ -110,6 +110,7 @@ class KeyVaultService:
         except OpenAIServiceUnavailableError:
             raise
         except Exception as exc:
+            print("ACTUAL_EXCEPTION=", repr(exc))
             logger.exception(
                 "[KEYVAULT] Credential refresh failed operation=%s error_type=%s",
                 operation_name,
@@ -220,6 +221,7 @@ class DynamicChatOpenAI:
                     **invoke_kwargs,
                 )
             except Exception as exc:
+                print("ACTUAL_EXCEPTION=", repr(exc))
                 if is_authentication_error(exc) and attempt == 1:
                     logger.warning(
                         "[OPENAI] Authentication rejected for %s; refreshing key",

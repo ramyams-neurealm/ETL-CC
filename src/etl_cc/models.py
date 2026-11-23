@@ -974,6 +974,10 @@ class ValidationMappingResponse(BaseModel):
     etl_object_id: int
     mapping_name: str
     migration_status: str
+    schema_validation: str | None = None
+    target_execution: str | None = None
+    schema_validation_details: dict[str, Any] | None = None
+    target_execution_details: dict[str, Any] | None = None
     static_validation: dict[str, Any] | None = None
     unit_test_execution: dict[str, Any] | None = None
     functional_parity: dict[str, Any] | None = None

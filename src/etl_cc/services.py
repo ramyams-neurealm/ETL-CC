@@ -2776,10 +2776,38 @@ async def list_validation_mappings(
             workflow_run_id=workflow.id,
             agent_name="FUNCTIONAL_PARITY_AGENT",
         )
+        validation = await _latest_agent_response(
+            session,
+            etl_object_id=mapping_id,
+            workflow_run_id=workflow.id,
+            agent_name="VALIDATION_AGENT",
+        )
+        validation_payload = validation.response_payload if validation else {}
+        validation_stages = validation_payload.get("stages", [])
+        schema_stage = next(
+            (
+                stage.get("response_payload")
+                for stage in validation_stages
+                if stage.get("stage_name") == "SCHEMA_VALIDATION"
+            ),
+            None,
+        )
+        target_stage = next(
+            (
+                stage.get("response_payload")
+                for stage in validation_stages
+                if stage.get("stage_name") == "TARGET_EXECUTION"
+            ),
+            None,
+        )
         result.append(ValidationMappingResponse(
             etl_object_id=mapping.id,
             mapping_name=mapping.object_name,
             migration_status=mapping.migration_status,
+            schema_validation=validation_payload.get("schema_validation"),
+            target_execution=validation_payload.get("target_execution"),
+            schema_validation_details=schema_stage,
+            target_execution_details=target_stage,
             static_validation=static.response_payload if static else None,
             unit_test_execution=unit.response_payload if unit else None,
             functional_parity=parity.response_payload if parity else None,

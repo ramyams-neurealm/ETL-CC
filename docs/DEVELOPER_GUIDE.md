@@ -237,7 +237,8 @@ If an exception occurs, `_fail` marks the conversion and the parent migration `F
    - `SIMULATE`: LLM synthetic rows expanded to `target_row_count`.
    - `DATASET_FILE`: uploaded via `POST /validations/datasets`.
    - `DATABASE_TABLES`: read through a connection saved with `POST /validation-database-connections`.
-4. `ValidationAgent.run` executes this pipeline:
+4. `ValidationAgent.run` validates source assignments and uploaded columns/types against the mapping schema before any Spark work. Failures are recorded as `SCHEMA_VALIDATION`; target execution is `SKIPPED`.
+5. On a compatible schema, `ValidationAgent.run` executes this pipeline:
    1. test plan
    2. synthetic data and its validation
    3. LLM **reference plan**, which is checked and then executed in memory by `RelationalIRExecutor`
@@ -247,7 +248,9 @@ If an exception occurs, `_fail` marks the conversion and the parent migration `F
    7. **MatchFlow** comparison of reference vs target rows
    8. confidence score
    9. optional GLiNER override
-5. **A mapping passes only if all of these hold:**
+
+The generated PySpark conversion artifact is reused; uploaded rows are never used to regenerate it. The mapping detail in the validation report exposes `schema_validation` and `target_execution` statuses, with structured stage diagnostics.
+6. **A mapping passes only if all of these hold:**
    - static, unit, synthetic, reference and target checks all PASSED
    - the reference oracle is `STRONG` with full coverage and no human-review flag
    - match % ≥ `minimum_functional_parity × 100`

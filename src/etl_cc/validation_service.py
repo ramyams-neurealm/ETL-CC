@@ -451,19 +451,62 @@ async def _process(workflow_id: int) -> None:
 
             input_mode = workflow.scope_payload.get("input_mode", "SIMULATE")
             input_datasets = {}
+            dataset_assignments = None
+            input_dataset_schemas = {}
             expected_output_rows = None
             requested_row_count = int((workflow.scope_payload.get("simulation_options") or {}).get("target_row_count", settings.validation_simulation_default_rows))
             if input_mode == "DATASET_FILE":
+                dataset_assignments = []
                 for item in workflow.scope_payload.get("dataset_files", []):
-                    input_datasets[item["dataset_name"]] = await validation_store.load_upload(session, item["upload_id"])
+                    assignment = {
+                        "dataset_name": item["dataset_name"],
+                        "upload_id": item["upload_id"],
+                    }
+                    try:
+                        uploaded = await validation_store.load_upload_with_schema(
+                            session, item["upload_id"]
+                        )
+                    except ValueError as exc:
+                        message = str(exc)
+                        assignment["load_error"] = message
+                        assignment["load_error_code"] = (
+                            "UPLOAD_NOT_FOUND"
+                            if "not found" in message.lower()
+                            else "UPLOAD_INVALID"
+                        )
+                    else:
+                        assignment["schema"] = uploaded["schema"]
+                        input_datasets.setdefault(
+                            item["dataset_name"], uploaded["rows"]
+                        )
+                        input_dataset_schemas.setdefault(
+                            item["dataset_name"], uploaded["schema"]
+                        )
+                    dataset_assignments.append(assignment)
             elif input_mode == "DATABASE_TABLES":
                 specification = workflow.scope_payload.get("database_tables") or {}
+                dataset_assignments = []
                 for item in specification.get("source_tables", []):
                     connection_row = await session.get(ValidationDatabaseConnectionETL, item["connection_id"])
                     if connection_row is None: raise RuntimeError("Validation database connection was not found.")
                     if connection_row.database_type != "POSTGRESQL": raise RuntimeError("UNSUPPORTED_DATABASE_TYPE")
                     password = validation_credential_cipher().decrypt(connection_row.credential_ciphertext)
-                    input_datasets[item["dataset_name"]] = await load_postgresql_table(connection_row.connection_config, password, item["schema_name"], item["table_name"], int(specification.get("row_limit", settings.validation_database_row_limit)))
+                    rows = await load_postgresql_table(
+                        connection_row.connection_config,
+                        password,
+                        item["schema_name"],
+                        item["table_name"],
+                        int(
+                            specification.get(
+                                "row_limit",
+                                settings.validation_database_row_limit,
+                            )
+                        ),
+                    )
+                    input_datasets.setdefault(item["dataset_name"], rows)
+                    dataset_assignments.append(
+                        {"dataset_name": item["dataset_name"]}
+                    )
                 target_spec = specification.get("target_table")
                 if specification.get("validation_type") == "TABLE_TO_TABLE_COMPARE" and target_spec:
                     connection_row = await session.get(ValidationDatabaseConnectionETL, target_spec["connection_id"])
@@ -495,6 +538,8 @@ async def _process(workflow_id: int) -> None:
                         minimum_functional_parity=minimum,
                         input_mode=input_mode,
                         input_datasets=input_datasets,
+                        dataset_assignments=dataset_assignments,
+                        input_dataset_schemas=input_dataset_schemas,
                         expected_output_rows=expected_output_rows,
                         requested_row_count=requested_row_count,
                     )

@@ -73,8 +73,10 @@ python -m etl_cc.discovery_eval discovery_eval_data --threshold 100 --output dis
 The report includes the extracted canonical mappings and a field-level list of
 mismatches. A non-zero process exit code means at least one case scored below
 the threshold.
-
+uvicorn etl_cc.main:app --app-dir src --reload
+.\.venv\Scripts\Activate.ps1
 python -m etl_cc.worker
+python -m etl_cc.langgraph_orchestrator
 python -m etl_cc.conversion_worker
 python -m etl_cc.validation_worker
 python -m etl_cc.deployment_worker
