@@ -215,10 +215,22 @@ Return structured critique only."""
                     unit_test,
                 )
             )
+            valid_decimal_type_finding = (
+                issue.category.upper() == "UNIT_TEST_NUMERIC_TYPE"
+                and CritiqueAgent._has_valid_decimal_literals(unit_test)
+            )
+            valid_null_group_by_finding = (
+                issue.category.upper() == "UNIT_TEST_SEMANTICS"
+                and "NULL" in text
+                and any(tok in text for tok in ("GROUP", "AGGREGAT"))
+                and CritiqueAgent._has_valid_null_group_by(mapping, unit_test)
+            )
             if (
                 null_only_finding
                 or projection_only_finding
                 or matching_risk_score_default
+                or valid_decimal_type_finding
+                or valid_null_group_by_finding
             ):
                 continue
             retained.append(issue)
@@ -235,6 +247,86 @@ Return structured critique only."""
             result.lineage_coverage = 1.0
         return result
 
+    @staticmethod
+    def _expected_rows_nodes(tree: ast.AST) -> list[ast.expr]:
+        """Extract all AST value nodes assigned to `expected_rows` (plain or annotated)."""
+        nodes: list[ast.expr] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "expected_rows"
+                for target in node.targets
+            ):
+                nodes.append(node.value)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "expected_rows"
+                and node.value is not None
+            ):
+                nodes.append(node.value)
+        return nodes
+
+    @staticmethod
+    def _has_valid_decimal_literals(unit_test: str) -> bool:
+        """Return True when Decimal(...) calls use string literals and expected_rows has no raw floats."""
+        try:
+            tree = ast.parse(unit_test)
+        except SyntaxError:
+            return False
+
+        has_decimal_call = False
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "Decimal"
+            ):
+                has_decimal_call = True
+                if (
+                    len(node.args) != 1
+                    or not isinstance(node.args[0], ast.Constant)
+                    or not isinstance(node.args[0].value, str)
+                ):
+                    return False
+
+        for value_node in CritiqueAgent._expected_rows_nodes(tree):
+            if any(
+                isinstance(child, ast.Constant) and isinstance(child.value, float)
+                for child in ast.walk(value_node)
+            ):
+                return False
+
+        return has_decimal_call
+
+    @staticmethod
+    def _has_valid_null_group_by(
+        mapping: CanonicalMapping,
+        unit_test: str,
+    ) -> bool:
+        """Return True when an AGGREGATE mapping has no upstream filter and retains None in expected_rows."""
+        has_aggregator = any(
+            "aggregat" in (t.transformation_type or "").lower()
+            for t in mapping.transformations
+        )
+        has_filter = any(
+            "filter" in (t.transformation_type or "").lower()
+            for t in mapping.transformations
+        )
+        if not has_aggregator or has_filter:
+            return False
+
+        try:
+            tree = ast.parse(unit_test)
+        except SyntaxError:
+            return False
+
+        for value_node in CritiqueAgent._expected_rows_nodes(tree):
+            if any(
+                isinstance(child, ast.Constant) and child.value is None
+                for child in ast.walk(value_node)
+            ):
+                return True
+        return False
     @staticmethod
     def _has_matching_null_risk_score_default(
         code: str,

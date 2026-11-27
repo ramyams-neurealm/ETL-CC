@@ -469,7 +469,7 @@ class SafeExpression:
             flags=re.I,
         )
         text = re.sub(r"\bSYSDATE\b", "validation_now()", text, flags=re.I)
-        
+
         text = re.sub(
             r"\bNOT\s+IN\s*\(([^()]*)\)",
             lambda item: f" not in [{item.group(1)}]",
@@ -1271,7 +1271,6 @@ class RelationalIRExecutor:
         return results
 
 
-
 class ValidationContext(BaseModel):
     workflow_id: str
     mapping: CanonicalMapping
@@ -1871,6 +1870,7 @@ class SyntheticDataValidator:
         except (InvalidOperation, ValueError, TypeError):
             errors.append(f"{test_id}: {name} has invalid value {value!r}")
         return errors
+
 
 class StaticCheck(BaseModel):
     check_name: str
@@ -2706,14 +2706,6 @@ class StaticImplementationCoverage:
         lowered = text.lower()
         return 1.0 if not items else sum(item.lower() in lowered for item in items) / len(items)
 
-    # @staticmethod
-    # def _rule_evidence(expression: str, code: str) -> float:
-    #     target = re.sub(r"\s+", "", code).lower()
-    #     identifiers = [token.lower() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression) if token.lower() not in {"upper", "lower", "and", "or", "not", "null"}]
-    #     functions = [token.lower() for token in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", expression)]
-    #     return 1.0 if identifiers and all(item in target for item in identifiers) and all(item in target for item in functions) else 0.0
-
-    # i make this comment due to the fact that the original rule evidence function did not account for semantic equivalence of certain functions and parameters, which could lead to false negatives in coverage scoring. The updated implementation includes mappings for common functions and parameters that may be represented differently in the code, ensuring a more accurate assessment of business rule coverage.
     @staticmethod
     def _rule_evidence(expression: str, code: str) -> float:
         target = re.sub(r"\s+", "", code).lower()
@@ -2782,10 +2774,6 @@ class StaticImplementationCoverage:
             and all(item in target for item in functions)
             else 0.0
         )
-
-
-
-
 
     @staticmethod
     def _precision(precision: int, scale: int, text: str) -> float:
@@ -3583,7 +3571,7 @@ class ValidationAgent:
                         severity="CRITICAL",
                         expected_result="Target execution runs only after schema validation passes.",
                         actual_result="SKIPPED",
-                        details=target.error_message,
+                        details="Target execution was skipped because the uploaded input data did not match the expected source schema.",
                         evidence_payload=target_payload,
                     ),
                 ]
@@ -4011,26 +3999,212 @@ class ValidationAgent:
         )
 
     @staticmethod
+    def _plain_english_error(raw_error: str | None, context_label: str) -> str:
+        """Translate technical Spark/Python/SQL errors into plain English for business users."""
+        if not raw_error:
+            return f"An unexpected error occurred during {context_label}."
+        text = raw_error.strip()
+        lower = text.lower()
+
+        col_match = re.search(
+            r"Column\s+'([^']+)'\s+cannot be resolved|cannot resolve\s+'([^']+)'",
+            text,
+            re.IGNORECASE,
+        )
+        if col_match:
+            col_name = col_match.group(1) or col_match.group(2)
+            return (
+                f"Field mismatch during {context_label}: the migrated logic tried to use "
+                f"column '{col_name}', which does not exist in the dataset."
+            )
+
+        if "decimal" in lower and ("assertionerror" in lower or "float" in lower):
+            return (
+                f"Numeric precision mismatch during {context_label}: the migrated code produced "
+                f"an exact currency/decimal number while the test expected a standard floating-point number."
+            )
+
+        if "assertionerror" in lower:
+            return (
+                f"Output mismatch during {context_label}: the records produced by the migrated "
+                f"code did not match the expected business outcome for this scenario."
+            )
+
+        if "nullpointerexception" in lower or "nonetype" in lower:
+            return (
+                f"Missing-value (NULL) handling issue during {context_label}: the migrated code "
+                f"encountered a blank/null field without a safe fallback rule."
+            )
+
+        if "syntaxerror" in lower:
+            return (
+                f"Code formatting error in the generated script during {context_label} that "
+                f"prevented it from running."
+            )
+
+        if "timeout" in lower or "exceeded" in lower:
+            return (
+                f"Processing took longer than the allowed time limit during {context_label}."
+            )
+
+        return (
+            f"The migrated pipeline encountered a processing error during {context_label} "
+            f"and could not complete validation."
+        )
+
+    @staticmethod
     def _synthetic_tests(generated: SyntheticTestDataResult, validation: SyntheticDataValidationResult) -> list[ValidationTestResult]:
         status = "PASSED" if validation.status == "PASSED" else "FAILED"
-        return [ValidationTestResult(test_id=item.test_id, test_name=item.title, category="SYNTHETIC_DATA", status=status, severity=item.severity, expected_result=item.expected_behavior, actual_result="Generated and schema-validated." if status == "PASSED" else "Deterministic validation failed.", details=item.description, evidence_payload={"scenario_category": item.category, "source_expression": item.source_expression, "input_rows": [row.as_dict() for row in item.input_rows]}) for item in generated.scenarios]
+        return [
+            ValidationTestResult(
+                test_id=item.test_id,
+                test_name=item.title,
+                category="SYNTHETIC_DATA",
+                status=status,
+                severity=item.severity,
+                expected_result=item.expected_behavior,
+                actual_result="Generated and schema-validated." if status == "PASSED" else "Schema or rule validation failed.",
+                details=item.description,
+                evidence_payload={
+                    "scenario_category": item.category,
+                    "source_expression": item.source_expression,
+                    "input_rows": [row.as_dict() for row in item.input_rows],
+                },
+            )
+            for item in generated.scenarios
+        ]
 
     @staticmethod
     def _static_tests(result: StaticValidationResult) -> list[ValidationTestResult]:
-        ids = {"REQUIRED_ARTIFACTS":"STATIC-001","PYSPARK_CODE_SYNTAX":"STATIC-002","UNIT_TEST_SYNTAX":"STATIC-003","CONFIGURATION_JSON":"STATIC-004","DATABRICKS_RUNTIME_SAFETY":"STATIC-005","NO_EMBEDDED_SECRETS":"STATIC-006","SAFE_TEST_IMPORTS":"STATIC-007"}
-        return [ValidationTestResult(test_id=ids[item.check_name], test_name=item.check_name.replace("_", " ").title(), category="STATIC_VALIDATION", status="PASSED" if item.passed else "FAILED", severity=item.severity, expected_result="Static check passes.", actual_result="PASSED" if item.passed else "FAILED", details=item.details, evidence_payload={"check_name": item.check_name}) for item in result.checks if item.check_name in ids]
+        ids = {
+            "REQUIRED_ARTIFACTS": "STATIC-001",
+            "PYSPARK_CODE_SYNTAX": "STATIC-002",
+            "UNIT_TEST_SYNTAX": "STATIC-003",
+            "CONFIGURATION_JSON": "STATIC-004",
+            "DATABRICKS_RUNTIME_SAFETY": "STATIC-005",
+            "NO_EMBEDDED_SECRETS": "STATIC-006",
+            "SAFE_TEST_IMPORTS": "STATIC-007",
+        }
+        plain_failures = {
+            "REQUIRED_ARTIFACTS": "One or more required migration output files (code, unit tests, or configuration) were not generated.",
+            "PYSPARK_CODE_SYNTAX": "The generated PySpark transformation script contains a syntax issue and cannot be compiled.",
+            "UNIT_TEST_SYNTAX": "The generated automated test script contains a syntax issue and cannot be run.",
+            "CONFIGURATION_JSON": "The generated pipeline configuration file is not valid JSON.",
+            "DATABRICKS_RUNTIME_SAFETY": "The generated transformation contains hardcoded session or file-write commands that are unsafe for production deployment.",
+            "NO_EMBEDDED_SECRETS": "Potential hardcoded credentials or API keys were detected in the generated files.",
+            "SAFE_TEST_IMPORTS": "The generated test script references restricted system or network libraries.",
+        }
+        items: list[ValidationTestResult] = []
+        for item in result.checks:
+            if item.check_name not in ids:
+                continue
+            detail_text = (
+                item.details
+                if item.passed
+                else plain_failures.get(item.check_name, item.details)
+            )
+            items.append(
+                ValidationTestResult(
+                    test_id=ids[item.check_name],
+                    test_name=item.check_name.replace("_", " ").title(),
+                    category="STATIC_VALIDATION",
+                    status="PASSED" if item.passed else "FAILED",
+                    severity=item.severity,
+                    expected_result="Static check passes.",
+                    actual_result="PASSED" if item.passed else "FAILED",
+                    details=detail_text,
+                    evidence_payload={
+                        "check_name": item.check_name,
+                        "technical_details": item.details,
+                    },
+                )
+            )
+        return items
 
     @staticmethod
     def _unit_tests(result: Any) -> list[ValidationTestResult]:
-        return [ValidationTestResult(test_id=item.test_id, test_name=item.title, category=item.category, status=item.status, severity="HIGH", expected_result="Generated pytest passes.", actual_result=item.status, details=item.details, evidence_payload=item.evidence, duration_seconds=item.duration_seconds) for item in result.test_cases]
+        items: list[ValidationTestResult] = []
+        for item in result.test_cases:
+            raw_title = str(getattr(item, "title", "") or "")
+            readable_title = (
+                re.sub(r"^test_\d+_", "", raw_title).replace("_", " ").strip().capitalize()
+                or raw_title
+            )
+            if item.status == "PASSED":
+                detail_text = f"Verified '{readable_title}' successfully in {item.duration_seconds:.2f}s."
+            else:
+                evidence = getattr(item, "evidence", {}) or {}
+                raw_trace = "\n".join(
+                    str(part)
+                    for part in (
+                        getattr(item, "details", ""),
+                        evidence.get("stdout", ""),
+                        evidence.get("stderr", ""),
+                    )
+                    if part
+                )
+                detail_text = ValidationAgent._plain_english_error(
+                    raw_trace,
+                    f"test scenario '{readable_title}'",
+                )
+            items.append(
+                ValidationTestResult(
+                    test_id=item.test_id,
+                    test_name=readable_title,
+                    category=item.category,
+                    status=item.status,
+                    severity="HIGH",
+                    expected_result="Generated pytest passes.",
+                    actual_result=item.status,
+                    details=detail_text,
+                    evidence_payload={
+                        **(getattr(item, "evidence", {}) or {}),
+                        "technical_details": getattr(item, "details", ""),
+                    },
+                    duration_seconds=item.duration_seconds,
+                )
+            )
+        return items
 
     @staticmethod
     def _coverage_tests(result: StaticCoverageResult, minimum: float) -> list[ValidationTestResult]:
-        values = [("PARITY-001","Source coverage",result.source_coverage,1.0),("PARITY-002","Target coverage",result.target_coverage,1.0),("PARITY-003","Target-field coverage",result.target_field_coverage,1.0),("PARITY-004","Business-rule coverage",result.business_rule_coverage,1.0),("PARITY-005","Lineage coverage",result.lineage_coverage,1.0),("PARITY-006","Precision and scale coverage",result.precision_scale_coverage,1.0),("PARITY-007","Overall static implementation coverage",result.overall_functional_parity,minimum)]
-        return [ValidationTestResult(test_id=test_id, test_name=name, category="FUNCTIONAL_PARITY", status="PASSED" if value >= threshold else "WARNING", severity="MEDIUM", expected_result=f"Diagnostic coverage >= {threshold:.2f}.", actual_result=f"{value:.4f}", details="Diagnostic only. MatchFlow is authoritative.", evidence_payload={"coverage": value, "threshold": threshold, "authoritative": False}) for test_id,name,value,threshold in values]
+        values = [
+            ("PARITY-001", "Source coverage", result.source_coverage, 1.0),
+            ("PARITY-002", "Target coverage", result.target_coverage, 1.0),
+            ("PARITY-003", "Target-field coverage", result.target_field_coverage, 1.0),
+            ("PARITY-004", "Business-rule coverage", result.business_rule_coverage, 1.0),
+            ("PARITY-005", "Lineage coverage", result.lineage_coverage, 1.0),
+            ("PARITY-006", "Precision and scale coverage", result.precision_scale_coverage, 1.0),
+            ("PARITY-007", "Overall static implementation coverage", result.overall_functional_parity, minimum),
+        ]
+        return [
+            ValidationTestResult(
+                test_id=test_id,
+                test_name=name,
+                category="FUNCTIONAL_PARITY",
+                status="PASSED" if value >= threshold else "WARNING",
+                severity="MEDIUM",
+                expected_result=f"Diagnostic coverage >= {threshold:.2f}.",
+                actual_result=f"{value:.4f}",
+                details=(
+                    f"{name} is {value * 100:.0f}% (meets the {threshold * 100:.0f}% diagnostic benchmark)."
+                    if value >= threshold
+                    else f"{name} is {value * 100:.0f}%, which is below the {threshold * 100:.0f}% diagnostic benchmark."
+                ),
+                evidence_payload={"coverage": value, "threshold": threshold, "authoritative": False},
+            )
+            for test_id, name, value, threshold in values
+        ]
 
     @staticmethod
-    def _data_tests(synthetic: SyntheticDataValidationResult, legacy: Any, target: TargetExecutionResult, match: MatchFlowResult | None, confidence: float, minimum: float) -> list[ValidationTestResult]:
+    def _data_tests(
+        synthetic: SyntheticDataValidationResult,
+        legacy: Any,
+        target: TargetExecutionResult,
+        match: MatchFlowResult | None,
+        confidence: float,
+        minimum: float,
+    ) -> list[ValidationTestResult]:
         threshold = float(getattr(settings, "validation_confidence_threshold", 0.90))
         failed_synthetic_checks = [
             check.model_dump(mode="json")
@@ -4038,19 +4212,103 @@ class ValidationAgent:
             if not check.passed
         ]
         synthetic_details = (
-            "Synthetic data is valid."
+            f"All {synthetic.valid_row_count:,} synthetic test records passed schema, key, and scenario coverage checks."
             if synthetic.status == "PASSED"
-            else "; ".join(
-                check["details"] for check in failed_synthetic_checks
-            )
+            else "Generated test data did not satisfy all source schema or scenario rules: "
+            + "; ".join(check["details"] for check in failed_synthetic_checks)
         )
-        rows = [
-            ("DATA-001", "Synthetic data validation", synthetic.status == "PASSED", synthetic.status, synthetic_details),
-            ("DATA-002", "Reference execution", legacy.status == "PASSED", legacy.status, legacy.error_message or f"Rows: {legacy.row_count}"),
-            ("DATA-003", "Target execution", target.status == "PASSED", target.status, target.error_message or f"Rows: {target.row_count}"),
+        ref_details = (
+            f"Legacy baseline simulation completed and produced {legacy.row_count:,} expected output record(s)."
+            if legacy.status == "PASSED"
+            else ValidationAgent._plain_english_error(legacy.error_message, "legacy baseline simulation")
+        )
+        target_details = (
+            f"Migrated PySpark pipeline completed and produced {target.row_count:,} output record(s)."
+            if target.status == "PASSED"
+            else "Migrated PySpark execution was skipped because prerequisite checks did not pass."
+            if target.status == "SKIPPED"
+            else ValidationAgent._plain_english_error(target.error_message, "migrated PySpark execution")
+        )
+
+        rows: list[tuple[str, str, bool, str, str, str]] = [
+            ("DATA-001", "Synthetic data validation", synthetic.status == "PASSED", synthetic.status, "Synthetic data is valid.", synthetic_details),
+            ("DATA-002", "Reference execution", legacy.status == "PASSED", legacy.status, f"Rows: {legacy.row_count}", ref_details),
+            ("DATA-003", "Target execution", target.status == "PASSED", target.status, f"Rows: {target.row_count}", target_details),
         ]
         if match:
-            rows += [("DATA-004","Rows compared",match.rows_compared > 0,str(match.rows_compared),"At least one row compared."),("DATA-005","Missing rows",match.missing_rows == 0,str(match.missing_rows),"No missing rows."),("DATA-006","Additional rows",match.additional_rows == 0,str(match.additional_rows),"No additional rows."),("DATA-007","Different rows",match.different_rows == 0,str(match.different_rows),"No different rows."),("DATA-008","MatchFlow functional parity",match.match_percentage >= minimum * 100,f"{match.match_percentage:.2f}%",f"Parity >= {minimum*100:.2f}%"),("DATA-009","Confidence index",confidence >= threshold,f"{confidence:.4f}",f"Confidence >= {threshold:.2f}")]
+            sample_diffs = getattr(match, "sample_differences", None) or []
+            diff_example = ""
+            if sample_diffs and isinstance(sample_diffs[0], dict):
+                first = sample_diffs[0]
+                key_part = ", ".join(f"{k}={v}" for k, v in (first.get("key") or {}).items())
+                col = first.get("column", "a field")
+                exp_val = first.get("expected")
+                act_val = first.get("actual")
+                record_ref = f" for record ({key_part})" if key_part else ""
+                diff_example = f" For example{record_ref}, '{col}' produced '{act_val}' instead of '{exp_val}'."
+
+            rows += [
+                (
+                    "DATA-004",
+                    "Rows compared",
+                    match.rows_compared > 0,
+                    str(match.rows_compared),
+                    "At least one row compared.",
+                    f"Compared {match.rows_compared:,} output record(s) between the legacy baseline and the migrated PySpark pipeline."
+                    if match.rows_compared > 0
+                    else "No output records were available to compare between the legacy baseline and migrated output.",
+                ),
+                (
+                    "DATA-005",
+                    "Missing rows",
+                    match.missing_rows == 0,
+                    str(match.missing_rows),
+                    "No missing rows.",
+                    "All expected records from the legacy baseline are present in the migrated output."
+                    if match.missing_rows == 0
+                    else f"{match.missing_rows:,} expected record(s) from the legacy baseline were dropped by the migrated pipeline.",
+                ),
+                (
+                    "DATA-006",
+                    "Additional rows",
+                    match.additional_rows == 0,
+                    str(match.additional_rows),
+                    "No additional rows.",
+                    "No unexpected extra records were produced by the migrated pipeline."
+                    if match.additional_rows == 0
+                    else f"The migrated pipeline produced {match.additional_rows:,} extra record(s) that the legacy baseline excluded.",
+                ),
+                (
+                    "DATA-007",
+                    "Different rows",
+                    match.different_rows == 0,
+                    str(match.different_rows),
+                    "No different rows.",
+                    f"All field values matched identically across all {match.rows_compared:,} compared record(s)."
+                    if match.different_rows == 0
+                    else f"{match.different_rows:,} record(s) had different field values compared to the legacy baseline.{diff_example}",
+                ),
+                (
+                    "DATA-008",
+                    "MatchFlow functional parity",
+                    match.match_percentage >= minimum * 100,
+                    f"{match.match_percentage:.2f}%",
+                    f"Parity >= {minimum * 100:.2f}%",
+                    f"Data accuracy is {match.match_percentage:.2f}% ({match.matched_rows:,} of {match.rows_compared:,} records matched; required threshold is {minimum * 100:.2f}%)."
+                    if match.match_percentage >= minimum * 100
+                    else f"Data accuracy is {match.match_percentage:.2f}% ({match.matched_rows:,} of {match.rows_compared:,} records matched), which is below the required {minimum * 100:.2f}% deployment threshold.",
+                ),
+                (
+                    "DATA-009",
+                    "Confidence index",
+                    confidence >= threshold,
+                    f"{confidence:.4f}",
+                    f"Confidence >= {threshold:.2f}",
+                    f"Validation confidence score is {confidence:.2f}, meeting the required {threshold:.2f} approval threshold."
+                    if confidence >= threshold
+                    else f"Validation confidence score is {confidence:.2f}, which is below the required {threshold:.2f} approval threshold.",
+                ),
+            ]
         evidence = {
             "synthetic_status": synthetic.status,
             "synthetic_checks": [
@@ -4081,62 +4339,96 @@ class ValidationAgent:
                     if test_id == "DATA-003" and target.status == "SKIPPED"
                     else "FAILED"
                 ),
-                severity="CRITICAL" if test_id in {"DATA-003","DATA-008","DATA-009"} else "HIGH",
-                expected_result=details,
+                severity="CRITICAL" if test_id in {"DATA-003", "DATA-008", "DATA-009"} else "HIGH",
+                expected_result=expected,
                 actual_result=actual,
                 details=details,
                 evidence_payload=evidence,
             )
-            for test_id, name, passed, actual, details in rows
+            for test_id, name, passed, actual, expected, details in rows
         ]
 
     @staticmethod
-    def _failure(static: StaticValidationResult, unit: Any, synthetic: SyntheticDataValidationResult, legacy: Any, target: TargetExecutionResult, match: MatchFlowResult | None, confidence: float, confidence_threshold: float, minimum: float) -> tuple[str, str]:
-        if static.status != "PASSED": return "Static validation failed.", "Regenerate artifacts and resolve static safety failures."
-        if unit.status != "PASSED": return "Generated unit tests failed.", "Review pytest evidence and regenerate the conversion."
-        if synthetic.status != "PASSED": return "Synthetic data validation failed.", "Regenerate canonical-schema-compliant synthetic data."
+    def _failure(
+        static: StaticValidationResult,
+        unit: Any,
+        synthetic: SyntheticDataValidationResult,
+        legacy: Any,
+        target: TargetExecutionResult,
+        match: MatchFlowResult | None,
+        confidence: float,
+        confidence_threshold: float,
+        minimum: float,
+    ) -> tuple[str, str]:
+        if static.status != "PASSED":
+            return (
+                "Generated code did not pass static safety and syntax checks.",
+                "Regenerate the migration artifacts to resolve syntax or safety issues.",
+            )
+        if unit.status != "PASSED":
+            failed_unit = next(
+                (tc for tc in getattr(unit, "test_cases", []) if tc.status != "PASSED"),
+                None,
+            )
+            detail = (
+                ValidationAgent._plain_english_error(
+                    getattr(failed_unit, "details", ""),
+                    "automated scenario testing",
+                )
+                if failed_unit
+                else "One or more automated business-scenario unit tests failed."
+            )
+            return detail, "Review the failed test scenario and re-run code conversion."
+        if synthetic.status != "PASSED":
+            return (
+                "Synthetic test data did not meet source schema or scenario coverage requirements.",
+                "Regenerate schema-compliant synthetic test data and retry validation.",
+            )
         if legacy.status != "PASSED":
             return (
-                legacy.error_message or "Reference execution failed.",
-                "Review the reference plan, unsupported constructs, and deterministic validation evidence.",
+                ValidationAgent._plain_english_error(
+                    legacy.error_message,
+                    "legacy baseline simulation",
+                ),
+                "Review unsupported legacy constructs or missing metadata before retrying.",
             )
         if legacy.oracle_strength != OracleStrength.STRONG:
             return (
-                "Reference execution is provisional and cannot authorize deployment.",
-                "Obtain a fully covered relational reference plan or a live legacy execution.",
+                "Legacy baseline coverage is only provisional and cannot authorize automatic deployment.",
+                "Supply complete mapping metadata or live baseline data for full verification.",
             )
-        # if legacy.human_review_required or not legacy.full_reference_coverage:
-        #     return (
-        #         "Reference coverage is incomplete.",
-        #         "Resolve assumptions or unsupported constructs before deployment.",
-        #     )
-        # i have commented out the above check because we want to allow deployment even if the reference coverage is incomplete, as long as the other checks pass. This is a business decision that may vary based on the specific use case.
         if legacy.human_review_required or not legacy.full_reference_coverage:
-
-            failed_rules = getattr(
-                legacy,
-                "missing_business_rules",
-                [],
-            )
-
+            failed_rules = getattr(legacy, "missing_business_rules", [])
             if failed_rules:
                 return (
-                    "Business rule coverage is incomplete. "
-                    f"Missing rules: {', '.join(failed_rules)}",
-                    "Review generated code and ensure all source business rules "
-                    "are preserved in the target implementation.",
+                    f"Business rule coverage is incomplete. Missing rules: {', '.join(failed_rules)}",
+                    "Ensure all source business rules are preserved in the migrated code.",
                 )
-
             return (
-                "Business rule coverage is incomplete.",
-                "Review generated code and ensure all source business rules "
-                "are preserved in the target implementation.",
+                "Business rule coverage is incomplete and requires review.",
+                "Ensure all source business rules are preserved in the migrated code.",
             )
-        
-        
-        
-        if target.status != "PASSED": return target.error_message or "Target execution failed.", "Review target logs and regenerate pure transform code."
-        if match is None: return "MatchFlow was not executed.", "Complete both executions before comparison."
-        if match.match_percentage < minimum * 100: return f"Parity {match.match_percentage:.2f}% is below {minimum*100:.2f}%.", "Review MatchFlow differences."
-        if confidence < confidence_threshold: return f"Confidence {confidence:.4f} is below {confidence_threshold:.2f}.", "Increase scenario/rule coverage or resolve assumptions."
-        return "Authoritative validation failed.", "Review DATA_PARITY evidence."
+        if target.status != "PASSED":
+            return (
+                ValidationAgent._plain_english_error(
+                    target.error_message,
+                    "migrated PySpark execution",
+                ),
+                "Review the execution failure and regenerate the PySpark transformation.",
+            )
+        if match is None:
+            return (
+                "Row-level data comparison could not be completed.",
+                "Ensure both legacy baseline and migrated outputs execute cleanly before comparing.",
+            )
+        if match.match_percentage < minimum * 100:
+            return (
+                f"Data accuracy is {match.match_percentage:.2f}% ({match.matched_rows:,} of {match.rows_compared:,} records matched), which is below the required {minimum * 100:.2f}% threshold.",
+                "Inspect the mismatched rows or values and adjust the transformation logic.",
+            )
+        if confidence < confidence_threshold:
+            return (
+                f"Overall validation confidence is {confidence:.2f}, which is below the required {confidence_threshold:.2f} threshold.",
+                "Increase test scenario coverage or resolve open mapping assumptions.",
+            )
+        return "Validation did not meet deployment approval criteria.", "Review validation results."
